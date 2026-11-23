@@ -1,233 +1,132 @@
 package com.arin.bypass.engine
 
 import com.arin.bypass.data.AppContainer
-import com.arin.bypass.model.LogLine
 import com.arin.bypass.model.Project
 import com.arin.bypass.model.Stage
 import com.arin.bypass.util.Trouble
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
-import java.io.File
-import kotlin.coroutines.coroutineContext
 
-/** Runs the whole chain on a background thread and keeps the project record up to date. */
-class Pipeline(private val container: AppContainer) {
+/**
+ * One project, one run, in the order the spec demands: the integrity sweep always
+ * comes before any paywall patch, and a dry run stops before installing.
+ */
+class Pipeline(private val c: AppContainer) {
 
-    private fun now(): Long = System.currentTimeMillis()
-
-    private fun line(level: String, message: String): LogLine = LogLine(now(), level, message)
-
-    private suspend fun note(project: Project, level: String, message: String): Project {
-        val updated = project.copy(
-            logs = (project.logs + line(level, message)).takeLast(800),
-            updatedAt = now()
-        )
-        container.projects.save(updated)
-        return updated
-    }
-
-    suspend fun prepare(
-        initial: Project,
-        log: (String) -> Unit,
-        progress: (String, Int) -> Unit
+    suspend fun run(
+        start: Project,
+        publish: (Project) -> Unit,
+        onProgress: (String, Int) -> Unit,
+        onLog: (String) -> Unit
     ): Result<Project> = withContext(Dispatchers.IO) {
-        var project = initial
         try {
-            coroutineContext.ensureActive()
-            progress("Checking the helper tools", 2)
-            project = note(project, "info", "Preparing ${project.packageName}")
-            val settings = container.settings.read()
+            val settings = c.settings.read()
+            var project = start
 
-            if (!container.toolchain.ready()) {
-                log("Installing the helper tools once")
-                val install = container.toolchain.install { message, percent ->
-                    progress(message, percent)
-                    log(message)
-                }
-                val error = install.exceptionOrNull()
-                if (error != null) {
-                    project = note(project, "error", Trouble.plain(error))
-                    return@withContext Result.failure(Exception(Trouble.plain(error.message)))
-                }
-                container.settings.setToolchainReady(true)
-            }
-            coroutineContext.ensureActive()
+            onProgress("Checking the tools", 3)
+            val tools = c.toolchain.install { text, percent -> onProgress(text, 3 + percent / 8) }
+            tools.onFailure { return@withContext Result.failure(Exception(it.message ?: "The tools could not be installed.")) }
 
-            progress("Making the project signing key", 8)
-            log("Making a signing key for this project")
-            val keyError = container.toolchain.ensureKeystore(project.id).exceptionOrNull()
-            if (keyError != null) {
-                project = note(project, "error", Trouble.plain(keyError))
-                return@withContext Result.failure(Exception(Trouble.plain(keyError.message)))
-            }
+            project = project.copy(stage = Stage.TOOLCHAIN)
+            publish(project)
 
+            onProgress("Unpacking the app", 16)
+            val decode = c.projects.decodeDir(project.id)
+            val java = c.projects.javaDir(project.id)
+            val decoded = c.decoder.decode(c.projects.workingFile(project), decode, java, onLog)
+            decoded.onFailure { return@withContext Result.failure(Exception(it.message ?: "Unpacking failed.")) }
             project = project.copy(stage = Stage.DECODE)
-            project = note(project, "info", "Unpacking resources and code")
+            publish(project)
 
-            progress("Unpacking the app", 15)
-            val decodeDir = container.projects.decodeDir(project.id)
-            val javaDir = container.projects.javaDir(project.id)
-            val decoded = container.decoder.decode(
-                container.projects.workingFile(project), decodeDir, javaDir
-            ) { text -> log(text) }
-            val decodeError = decoded.exceptionOrNull()
-            if (decodeError != null) {
-                project = note(project, "error", Trouble.plain(decodeError))
-                return@withContext Result.failure(Exception(Trouble.plain(decodeError.message)))
-            }
+            onProgress("Scanning every smali file", 42)
+            val found = c.scanner.scan(decode, java, onLog)
+            val seen = project.findings.map { it.ruleId + it.file + it.symbol }.toSet()
+            project = project.copy(
+                findings = project.findings + found.filter { (it.ruleId + it.file + it.symbol) !in seen },
+                stage = Stage.SCAN
+            )
+            publish(project)
 
-            coroutineContext.ensureActive()
-            progress("Scanning for server checks", 40)
-            log("Scanning for network, pinning, auth, billing and force-update code")
-            val findings = container.scanner.scan(decodeDir, javaDir) { log(it) }
-            project = note(project.copy(findings = findings, stage = Stage.SCAN), "info", "Found ${findings.size} hits")
+            onProgress("Integrity sweep before any paywall patch", 58)
+            val (swept, integrityNotes) = c.integrity.sweep(project, decode) { onLog(it) }
+            integrityNotes.forEach(onLog)
+            project = swept.copy(stage = Stage.INTEGRITY)
+            publish(project)
 
-            coroutineContext.ensureActive()
-            progress("Trusting user certificates and dropping pinning", 55)
-            project = project.copy(stage = Stage.INTEGRITY)
-            val (swept, integrityNotes) = container.integrity.sweep(project, decodeDir) { log(it) }
-            project = swept
-            for (noteText in integrityNotes) project = note(project, "warn", noteText)
+            onProgress("Bypassing the entitlement", 68)
+            val (billed, billingNotes) = c.billing.apply(project) { onLog(it) }
+            billingNotes.forEach(onLog)
+            project = billed.copy(stage = Stage.BILLING)
+            publish(project)
 
-            coroutineContext.ensureActive()
-            progress("Granting the entitlement", 70)
-            project = project.copy(stage = Stage.BILLING)
-            val (billed, billingNotes) = container.billing.apply(project) { log(it) }
-            project = billed
-            for (noteText in billingNotes) project = note(project, "warn", noteText)
-
-            coroutineContext.ensureActive()
-            progress("Repairing the manifest", 82)
-            val (repaired, repairNotes) = container.repairs.repair(project) { log(it) }
-            project = repaired
-            for (noteText in repairNotes) project = note(project, "info", noteText)
+            onProgress("Repairing the manifest", 76)
+            val (repaired, repairNotes) = c.repairs.repair(project) { onLog(it) }
+            repairNotes.forEach(onLog)
+            project = repaired.copy(
+                stillBroken = (repaired.stillBroken + repairNotes.filter {
+                    it.contains("raised") || it.contains("cleartext") || it.contains("Exported")
+                }).distinct()
+            )
+            publish(project)
 
             if (settings.renameClones) {
-                coroutineContext.ensureActive()
-                progress("Renaming so the clone installs beside the original", 90)
-                val newPackage = container.renamer.suggest(project.packageName)
-                val (renamed, renameMessage) = container.renamer.rename(project, decodeDir, newPackage) { log(it) }
+                onProgress("Renaming so the clone installs beside the original", 82)
+                val target = c.renamer.suggest(project.renameTo ?: project.packageName)
+                val (renamed, note) = c.renamer.rename(project, decode, target) { onLog(it) }
+                onLog(note)
                 project = renamed
-                project = note(project, "info", renameMessage)
+                publish(project)
             }
 
-            for (patch in project.patches.filter { !it.reverted }) {
-                log("Patch: ${patch.title}")
-                project = note(project, "patch", "${patch.title} -> ${patch.file}")
-            }
-
-            project = note(
-                project.copy(stage = Stage.REVIEW, stopped = false),
-                "info",
-                "Ready to rebuild with ${project.appliedPatches} patches and ${project.openFindings} open hits"
-            )
-            progress("Done", 100)
-            Result.success(project)
-        } catch (e: Exception) {
-            val plain = Trouble.plain(e)
-            val latest = container.projects.load(project.id) ?: project
-            container.projects.save(
-                latest.copy(
-                    stage = Stage.STOPPED,
-                    stopped = true,
-                    logs = (latest.logs + line("error", plain)).takeLast(800)
-                )
-            )
-            Result.failure(Exception(plain))
-        }
-    }
-
-    suspend fun rebuild(
-        initial: Project,
-        log: (String) -> Unit,
-        progress: (String, Int) -> Unit
-    ): Result<Project> = withContext(Dispatchers.IO) {
-        var project = initial.copy(stage = Stage.REBUILD)
-        try {
-            project = note(project, "info", "Rebuilding the app")
-            progress("Rebuilding the app", 10)
-            log("Rebuilding the app")
-            val outDir = container.projects.outDir(project.id)
-            val result: BuildResult = container.builder.build(
-                project, container.projects.decodeDir(project.id), outDir
-            ) { text -> log(text) }
-            when (result) {
+            onProgress("Rebuilding and signing", 88)
+            val outDir = c.projects.outDir(project.id)
+            val built = c.builder.build(project, decode, outDir, onLog)
+            val apk = when (built) {
                 is BuildResult.Failure -> {
-                    project = note(project, "error", result.message)
-                    Result.failure(Exception(result.message))
+                    onLog(built.message)
+                    val stopped = project.copy(stage = Stage.STOPPED, stopped = true)
+                    publish(stopped)
+                    return@withContext Result.failure(Exception(built.message))
                 }
-                is BuildResult.Success -> {
-                    progress("Signed", 90)
-                    project = note(
-                        project.copy(
-                            stage = Stage.VERIFY,
-                            outputApk = result.apk.absolutePath,
-                            stillBroken = emptyList()
-                        ),
-                        "info",
-                        "Signed output ${result.apk.name}"
-                    )
-                    Result.success(project)
+                is BuildResult.Success -> built.apk
+            }
+            project = project.copy(stage = Stage.VERIFY, outputApk = apk.absolutePath)
+            publish(project)
+
+            if (project.dryRun) {
+                onLog("Dry run is on, so nothing was installed. The built file waits in the project folder.")
+                val report = c.reporter.markdown(project, "built but not installed (dry run)")
+                c.projects.writeReport(project, report)
+                val ready = project.copy(stage = Stage.REVIEW, report = report)
+                publish(ready)
+                return@withContext Result.success(ready)
+            }
+
+            onProgress("Launching the clone", 93)
+            val (looped, problem) = c.loop.run(project, apk, settings.roundLimit, onLog) { current ->
+                onLog("Rebuilding after a failed round")
+                when (val again = c.builder.build(current, decode, outDir, onLog)) {
+                    is BuildResult.Success -> again.apk
+                    is BuildResult.Failure -> null
                 }
             }
-        } catch (e: Exception) {
-            val plain = Trouble.plain(e)
-            project = note(project, "error", plain)
-            Result.failure(Exception(plain))
-        }
-    }
 
-    suspend fun verify(
-        initial: Project,
-        log: (String) -> Unit,
-        progress: (String, Int) -> Unit
-    ): Result<Project> = withContext(Dispatchers.IO) {
-        var project = initial
-        val limit = container.settings.read().roundLimit
-        try {
-            while (project.rounds < limit) {
-                coroutineContext.ensureActive()
-                progress("Round ${project.rounds + 1} of $limit: watching the clone", 20 + project.rounds * 10)
-                val outcome = container.loop.run(project.packageName) { log(it) }
-                project = project.copy(rounds = project.rounds + 1)
-                if (outcome.healthy) {
-                    project = note(project, "info", "The clone stayed open after ${project.rounds} round(s).")
-                    return@withContext Result.success(
-                        project.copy(stage = Stage.DONE, crashLooping = false, stillBroken = emptyList())
-                    )
-                }
-                project = note(project, "warn", outcome.reason)
-                project = project.copy(stillBroken = (project.stillBroken + outcome.reason).distinct())
-                log(container.loop.hint(outcome.reason))
-                val rebuilt = rebuild(project, log, progress)
-                val error = rebuilt.exceptionOrNull()
-                if (error != null) return@withContext Result.failure(error)
-                project = rebuilt.getOrThrow()
-            }
-            project = note(project, "warn", "Stopped after $limit rounds. The diff is kept so you can look by hand.")
-            Result.success(project.copy(crashLooping = true, stage = Stage.STOPPED))
-        } catch (e: Exception) {
-            val plain = Trouble.plain(e)
-            project = note(project, "error", plain)
-            Result.failure(Exception(plain))
-        }
-    }
-
-    suspend fun export(project: Project): Result<File> = withContext(Dispatchers.IO) {
-        if (project.crashLooping) {
-            return@withContext Result.failure(
-                Exception("The clone still crash-loops, so it is not exported yet. Run the watch loop again first.")
+            val verdict = problem ?: "installed and stayed open"
+            val report = c.reporter.markdown(looped, verdict)
+            c.projects.writeReport(project, report)
+            val finished = looped.copy(
+                report = report,
+                stage = if (problem == null) Stage.REVIEW else Stage.STOPPED,
+                stopped = problem != null,
+                stillBroken = looped.stillBroken.distinct()
             )
+            publish(finished)
+            Result.success(finished)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Result.failure(Exception(Trouble.plain(e)))
         }
-        val apk = project.outputApk?.let { File(it) }
-        if (apk == null || !apk.exists()) {
-            return@withContext Result.failure(Exception("There is no rebuilt app yet. Rebuild first."))
-        }
-        val target = container.projects.exportCopy(project, apk)
-        val updated = project.copy(exported = true, outputApk = target.absolutePath, updatedAt = now())
-        container.projects.save(updated)
-        container.projects.writeReport(updated, container.reporter.markdown(updated))
-        Result.success(target)
     }
 }

@@ -1,18 +1,22 @@
 package com.arin.bypass.viewmodel
 
-import android.content.Intent
+import android.content.Context
 import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.arin.bypass.data.AppContainer
+import com.arin.bypass.engine.Shell
 import com.arin.bypass.model.Finding
+import com.arin.bypass.model.HitCategory
+import com.arin.bypass.model.Ids
 import com.arin.bypass.model.LogLine
 import com.arin.bypass.model.PatchKind
+import com.arin.bypass.model.PatchRecord
 import com.arin.bypass.model.Project
 import com.arin.bypass.model.Settings
 import com.arin.bypass.model.Stage
-import com.arin.bypass.util.Format
+import com.arin.bypass.service.ForegroundSyncService
 import com.arin.bypass.util.Trouble
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -25,402 +29,544 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 
-class BypassViewModel(private val container: AppContainer) : ViewModel() {
+data class InstalledApp(val packageName: String, val label: String, val system: Boolean)
 
-    data class InstalledApp(val packageName: String, val label: String)
+data class ToolState(val name: String, val present: Boolean)
 
-    data class UiState(
-        val loading: Boolean = true,
-        val projects: List<Project> = emptyList(),
-        val selectedId: String? = null,
-        val selected: Project? = null,
-        val settings: Settings = Settings(),
-        val busy: Boolean = false,
-        val progress: Int = 0,
-        val progressLabel: String = "",
-        val liveLog: List<LogLine> = emptyList(),
-        val diffTitle: String = "",
-        val diff: String = "",
-        val message: String? = null,
-        val installed: List<InstalledApp> = emptyList(),
-        val installedLoaded: Boolean = false,
-        val codePath: String = "",
-        val codeText: String = "",
-        val javaText: String = "",
-        val codeTab: Int = 0,
-        val reportText: String = ""
-    )
+data class UiState(
+    val ready: Boolean = false,
+    val busy: Boolean = false,
+    val progress: Int = 0,
+    val progressText: String = "",
+    val message: String? = null,
+    val settings: Settings = Settings(),
+    val projects: List<Project> = emptyList(),
+    val open: Project? = null,
+    val logs: List<LogLine> = emptyList(),
+    val tools: List<ToolState> = emptyList(),
+    val keystores: Int = 0,
+    val apps: List<InstalledApp> = emptyList(),
+    val appsLoading: Boolean = false,
+    val appFilter: String = "",
+    val diff: String? = null,
+    val diffTitle: String = "",
+    val editorPath: String? = null,
+    val editorText: String = "",
+    val javaText: String = "",
+    val javaAvailable: Boolean = false,
+    val filter: HitCategory? = null,
+    val reportOpen: Boolean = false
+) {
+    val visibleFindings: List<Finding>
+        get() = open?.findings
+            ?.filter { !it.dismissed && (filter == null || it.category == filter) }
+            ?.sortedByDescending { it.confidence }
+            .orEmpty()
+}
 
-    private val _state = MutableStateFlow(UiState())
-    val state: StateFlow<UiState> = _state.asStateFlow()
+class BypassViewModel(private val c: AppContainer) : ViewModel() {
 
-    private var job: Job? = null
+    private val _ui = MutableStateFlow(UiState())
+    val ui: StateFlow<UiState> = _ui.asStateFlow()
+    private var work: Job? = null
 
     init {
-        bootstrap()
-    }
-
-    private fun now(): Long = System.currentTimeMillis()
-
-    fun bootstrap() {
         viewModelScope.launch {
-            val settings = runCatching { container.settings.read() }.getOrDefault(Settings())
-            val projects = withContext(Dispatchers.IO) { container.projects.list() }
-            _state.update { it.copy(loading = false, settings = settings, projects = projects) }
+            val settings = withContext(Dispatchers.IO) { c.settings.read() }
+            _ui.update { it.copy(settings = settings, ready = true) }
         }
+        refreshProjects()
+        refreshTools()
     }
 
-    fun clearMessage() = _state.update { it.copy(message = null) }
-
-    fun clearDiff() = _state.update { it.copy(diff = "", diffTitle = "") }
-
-    private fun log(level: String, message: String) {
-        val entry = LogLine(System.currentTimeMillis(), level, message)
-        _state.update { it.copy(liveLog = (it.liveLog + entry).takeLast(800)) }
+    fun toast(text: String) {
+        _ui.update { it.copy(message = text) }
     }
 
-    private fun progress(label: String, percent: Int) {
-        _state.update { it.copy(progressLabel = label, progress = percent.coerceIn(0, 100)) }
+    fun log(level: String, text: String) {
+        val line = LogLine(System.currentTimeMillis(), level, text)
+        _ui.update { it.copy(logs = (it.logs + line).takeLast(600)) }
     }
 
-    private suspend fun save(project: Project) = container.projects.save(project)
-
-    private suspend fun reload() {
-        val projects = withContext(Dispatchers.IO) { container.projects.list() }
-        val id = _state.value.selectedId
-        val selected = id?.let { current -> projects.firstOrNull { it.id == current } }
-        _state.update { it.copy(projects = projects, selected = selected) }
+    private fun progress(text: String, percent: Int) {
+        _ui.update { it.copy(progressText = text, progress = percent.coerceIn(0, 100)) }
+        log("tool", text)
     }
 
-    private fun run(label: String, block: suspend () -> Unit) {
-        if (job?.isActive == true) return
-        job = viewModelScope.launch {
-            _state.update {
-                it.copy(busy = true, progress = 0, progressLabel = label, diff = "", diffTitle = "")
-            }
+    private fun launchWork(title: String, block: suspend () -> Unit) {
+        if (work?.isActive == true) {
+            toast("Something is still running. Cancel it first.")
+            return
+        }
+        work = viewModelScope.launch {
+            _ui.update { it.copy(busy = true, progress = 0, progressText = title) }
+            ForegroundSyncService.start(c.context)
             try {
                 block()
             } catch (e: CancellationException) {
-                log("warn", "Cancelled. The project is kept and can be resumed.")
-                _state.update { it.copy(message = "Cancelled. Everything done so far is kept.") }
+                log("warn", "Cancelled. The project is kept and can be started again.")
+                throw e
             } catch (e: Exception) {
                 val plain = Trouble.plain(e)
                 log("error", plain)
-                _state.update { it.copy(message = plain) }
+                toast(plain)
             } finally {
-                _state.update { it.copy(busy = false, progress = 0, progressLabel = "") }
-                reload()
+                _ui.update { it.copy(busy = false, progressText = "", progress = 0) }
+                ForegroundSyncService.stop(c.context)
             }
         }
     }
 
     fun cancel() {
-        job?.cancel()
-        val project = _state.value.selected ?: return
+        work?.cancel()
+        val project = _ui.value.open
+        if (project != null) {
+            val halted = project.copy(stage = Stage.STOPPED, stopped = true, updatedAt = System.currentTimeMillis())
+            viewModelScope.launch { c.projects.save(halted.copy(logs = _ui.value.logs)) }
+            _ui.update { it.copy(open = halted) }
+        }
+        toast("Cancelled. Nothing is lost.")
+    }
+
+    fun refreshProjects() {
         viewModelScope.launch {
-            val stopped = project.copy(stage = Stage.STOPPED, stopped = true, updatedAt = now())
-            save(stopped)
-            _state.update { it.copy(selected = stopped) }
+            val list = withContext(Dispatchers.IO) { c.projects.list() }
+            _ui.update { it.copy(projects = list) }
         }
     }
 
-    fun open(id: String) {
-        val project = _state.value.projects.firstOrNull { it.id == id } ?: container.projects.load(id) ?: return
-        _state.update { it.copy(selectedId = id, selected = project, reportText = "") }
-    }
-
-    fun addFromUri(uri: Uri) = run("Reading the picked file") {
-        val project = container.intake.fromUri(uri) { log("tool", it) }.getOrThrow()
-        open(project.id)
-        if (container.settings.read().autoScan) prepareAndPatch(project)
-    }
-
-    fun addInstalled(packageName: String) = run("Reading the installed app") {
-        val project = container.intake.fromInstalled(packageName) { log("tool", it) }.getOrThrow()
-        open(project.id)
-        if (container.settings.read().autoScan) prepareAndPatch(project)
-    }
-
-    fun start(id: String) {
-        val project = _state.value.selected ?: return
-        if (project.id != id) return
-        run("Preparing the project") { prepareAndPatch(project) }
-    }
-
-    private suspend fun prepareAndPatch(initial: Project) {
-        var project = initial
-        val result = container.pipeline.prepare(
-            project,
-            log = { message -> log("tool", message) },
-            progress = { label, percent -> progress(label, percent) }
-        )
-        val error = result.exceptionOrNull()
-        if (error != null) {
-            val latest = container.projects.load(project.id) ?: project
-            val stopped = latest.copy(stage = Stage.STOPPED, stopped = true, updatedAt = now())
-            save(stopped)
-            _state.update { it.copy(selected = stopped) }
-            throw error
-        }
-        project = result.getOrThrow()
-        _state.update { it.copy(selected = project, selectedId = project.id) }
-        save(project)
-        log("info", "Stage ${project.stage.name}: ${project.appliedPatches} patches, ${project.openFindings} open hits")
-    }
-
-    fun rebuild() {
-        val project = _state.value.selected ?: return
-        run("Rebuilding the clone") {
-            val result = container.pipeline.rebuild(
-                project,
-                log = { message -> log("tool", message) },
-                progress = { label, percent -> progress(label, percent) }
-            )
-            val updated = result.getOrThrow()
-            _state.update { it.copy(selected = updated) }
-        }
-    }
-
-    fun install() {
-        val project = _state.value.selected ?: return
-        val apk = project.outputApk?.let { File(it) }
-        if (apk == null || !apk.exists()) {
-            _state.update { it.copy(message = "Rebuild first, there is no signed app yet.") }
-            return
-        }
-        run("Opening the installer") {
-            log("info", "Installing ${apk.name}")
-            container.installer.install(apk).getOrThrow()
-            _state.update { it.copy(message = "Confirm the install in the phone's installer, then tap Watch.") }
-        }
-    }
-
-    fun watch() {
-        val project = _state.value.selected ?: return
-        run("Watching the clone") {
-            val result = container.pipeline.verify(
-                project,
-                log = { message -> log("tool", message) },
-                progress = { label, percent -> progress(label, percent) }
-            )
-            val updated = result.getOrThrow()
-            _state.update { it.copy(selected = updated) }
-        }
-    }
-
-    fun export() {
-        val project = _state.value.selected ?: return
-        run("Exporting the clone") {
-            val file = container.pipeline.export(project).getOrThrow()
-            log("info", "Exported to ${file.absolutePath}")
-            _state.update { it.copy(message = "Exported to ${file.name}") }
-        }
-    }
-
-    fun previewFinding(findingId: String) {
-        val project = _state.value.selected ?: return
-        val finding = project.findings.firstOrNull { it.id == findingId } ?: return
+    fun refreshTools() {
         viewModelScope.launch {
-            val preview = withContext(Dispatchers.IO) { container.actions.preview(project, finding) }
-            if (preview.isBlank()) {
-                _state.update { it.copy(message = "There is nothing to preview for this hit.") }
-            } else {
-                _state.update { it.copy(diff = preview, diffTitle = finding.title) }
+            val tools = withContext(Dispatchers.IO) {
+                listOf("java", "keytool", "apktool", "jadx", "zipalign", "apksigner")
+                    .map { ToolState(it, Shell.which(it) != null) }
             }
-        }
-    }
-
-    fun patchFinding(findingId: String) {
-        val project = _state.value.selected ?: return
-        val finding = project.findings.firstOrNull { it.id == findingId } ?: return
-        run("Patching ${finding.title}") {
-            val result = container.actions.patch(project, finding)
-            save(result.project)
-            log("patch", result.message)
-            _state.update {
-                it.copy(selected = result.project, diff = result.diff, diffTitle = result.message)
+            val stores = withContext(Dispatchers.IO) {
+                c.toolchain.keystoreDir().listFiles()?.count { it.name.endsWith(".jks") } ?: 0
             }
+            _ui.update { it.copy(tools = tools, keystores = stores) }
         }
     }
 
-    fun replaceEndpoint(findingId: String, newUrl: String) {
-        val project = _state.value.selected ?: return
-        val finding: Finding = project.findings.firstOrNull { it.id == findingId } ?: return
-        if (newUrl.isBlank()) return
-        run("Replacing the base URL") {
-            val result = container.actions.replaceEndpoint(project, finding, newUrl.trim())
-            save(result.project)
-            log("patch", result.message)
-            _state.update {
-                it.copy(selected = result.project, diff = result.diff, diffTitle = result.message)
-            }
+    // ---------- intake ----------
+
+    fun createFromUri(uri: Uri) = launchWork("Opening the picked file") {
+        progress("Copying the file into a project", 12)
+        val result = c.intake.fromUri(uri) { log("tool", it) }
+        result.onFailure {
+            val plain = it.message ?: "That file could not be read."
+            log("error", plain)
+            toast(plain)
+        }
+        result.onSuccess { project ->
+            val settings = c.settings.read()
+            val prepared = project.copy(dryRun = settings.dryRun).copy(logs = _ui.value.logs)
+            c.projects.save(prepared)
+            _ui.update { it.copy(open = prepared) }
+            refreshProjects()
+            toast("Project ready: ${prepared.name}")
         }
     }
 
-    fun dismissFinding(findingId: String) {
-        val project = _state.value.selected ?: return
-        run("Dismissing the hit") {
-            val updated = project.copy(
-                findings = project.findings.map { if (it.id == findingId) it.copy(dismissed = true) else it },
-                updatedAt = now()
-            )
-            save(updated)
-            _state.update { it.copy(selected = updated) }
+    fun createFromInstalled(packageName: String) = launchWork("Opening the installed app") {
+        val result = c.intake.fromInstalled(packageName) { log("tool", it) }
+        result.onFailure {
+            val plain = it.message ?: "That app could not be read."
+            log("error", plain)
+            toast(plain)
         }
-    }
-
-    fun revert(patchId: String) {
-        val project = _state.value.selected ?: return
-        run("Reverting one change") {
-            val updated = container.patcher.revert(project, patchId)
-            save(updated)
-            _state.update { it.copy(selected = updated) }
-            log("info", "Reverted one change")
-        }
-    }
-
-    fun revertAll() {
-        val project = _state.value.selected ?: return
-        run("Reverting everything") {
-            val updated = container.patcher.revertAll(project)
-            save(updated)
-            _state.update { it.copy(selected = updated) }
-            log("info", "All changes reverted")
-        }
-    }
-
-    fun openFile(relPath: String) = run("Opening ${relPath.substringAfterLast('/')}") {
-        val project = _state.value.selected ?: return@run
-        val file = File(container.projects.decodeDir(project.id), relPath)
-        val text = withContext(Dispatchers.IO) { if (file.isFile) file.readText() else "" }
-        val java = withContext(Dispatchers.IO) { findJava(project, relPath) }
-        _state.update { it.copy(codePath = relPath, codeText = text, javaText = java, codeTab = 0) }
-    }
-
-    private fun findJava(project: Project, relPath: String): String {
-        var name = relPath.substringAfterLast('/').removeSuffix(".smali")
-        val outer = name.substringBefore('$')
-        name = if (outer.isEmpty()) name else outer
-        val javaDir = container.projects.javaDir(project.id)
-        val target = javaDir.walkTopDown()
-            .filter { it.isFile && it.name == "$name.java" }
-            .take(1)
-            .firstOrNull() ?: return "No readable Java version of this file was produced."
-        return target.readText()
-    }
-
-    fun saveCode(newText: String) {
-        val project = _state.value.selected ?: return
-        val path = _state.value.codePath
-        if (path.isBlank()) return
-        run("Saving ${path.substringAfterLast('/')}") {
-            val record = container.patcher.patchText(
-                project,
-                path,
-                "Manual edit of ${path.substringAfterLast('/')}",
-                PatchKind.NOTE,
-                null
-            ) { newText }
-            if (record == null) {
-                _state.update { it.copy(message = "Nothing changed in that file.") }
-            } else {
-                val updated = project.copy(patches = project.patches + record, updatedAt = now())
-                save(updated)
-                log("patch", "Saved by hand: $path")
-                _state.update {
-                    it.copy(selected = updated, diff = record.diff, diffTitle = record.title)
-                }
-            }
-        }
-    }
-
-    fun makeReport() {
-        val project = _state.value.selected ?: return
-        viewModelScope.launch {
-            val markdown = container.reporter.markdown(project)
-            val file = withContext(Dispatchers.IO) { container.projects.writeReport(project, markdown) }
-            _state.update { it.copy(reportText = markdown, message = "Report saved as ${file.name}") }
-        }
-    }
-
-    fun exportLog() {
-        val project = _state.value.selected ?: return
-        viewModelScope.launch {
-            val text = buildString {
-                project.logs.forEach { appendLine("${Format.day(it.time)} ${it.level} ${it.message}") }
-                _state.value.liveLog.forEach { appendLine("${Format.day(it.time)} ${it.level} ${it.message}") }
-            }
-            val file = withContext(Dispatchers.IO) {
-                File(container.projects.exports(), "log-${project.id}-${System.currentTimeMillis()}.txt")
-                    .apply { writeText(text) }
-            }
-            _state.update { it.copy(message = "Log saved as ${file.name}") }
-        }
-    }
-
-    fun delete(id: String) {
-        viewModelScope.launch {
-            withContext(Dispatchers.IO) { container.projects.delete(id) }
-            _state.update {
-                it.copy(
-                    projects = it.projects.filterNot { item -> item.id == id },
-                    selected = if (it.selectedId == id) null else it.selected,
-                    selectedId = if (it.selectedId == id) null else it.selectedId
-                )
-            }
-            log("info", "Project deleted")
+        result.onSuccess { project ->
+            val settings = c.settings.read()
+            val prepared = project.copy(dryRun = settings.dryRun).copy(logs = _ui.value.logs)
+            c.projects.save(prepared)
+            _ui.update { it.copy(open = prepared) }
+            refreshProjects()
+            toast("Project ready: ${prepared.name}")
         }
     }
 
     fun loadInstalled() {
-        if (_state.value.installedLoaded) return
+        if (_ui.value.appsLoading) return
         viewModelScope.launch {
-            val apps = withContext(Dispatchers.IO) {
-                val manager = container.context.packageManager
-                val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
-                @Suppress("DEPRECATION")
-                manager.queryIntentActivities(intent, 0).mapNotNull { info ->
-                    val pkg = info.activityInfo?.packageName ?: return@mapNotNull null
-                    if (pkg == container.context.packageName) return@mapNotNull null
-                    InstalledApp(pkg, runCatching { info.loadLabel(manager).toString() }.getOrDefault(pkg))
-                }.distinctBy { it.packageName }.sortedBy { it.label.lowercase() }
+            _ui.update { it.copy(appsLoading = true) }
+            val list = withContext(Dispatchers.IO) {
+                val manager = c.context.packageManager
+                manager.getInstalledPackages(0).mapNotNull { info ->
+                    val app = info.applicationInfo ?: return@mapNotNull null
+                    val system = (app.flags and android.content.pm.ApplicationInfo.FLAG_SYSTEM) != 0
+                    val label = runCatching { app.loadLabel(manager).toString() }.getOrDefault(info.packageName)
+                    InstalledApp(info.packageName, label, system)
+                }.sortedBy { it.label.lowercase() }
             }
-            _state.update { it.copy(installed = apps, installedLoaded = true) }
+            _ui.update { it.copy(apps = list, appsLoading = false) }
         }
     }
 
-    fun setDryRun(value: Boolean) {
-        viewModelScope.launch {
-            container.settings.setDryRun(value)
-            _state.update { it.copy(settings = it.settings.copy(dryRun = value)) }
+    fun setAppFilter(text: String) = _ui.update { it.copy(appFilter = text) }
+
+    // ---------- tools ----------
+
+    fun installTools() {
+        launchWork("Installing the tools") {
+            val result = c.toolchain.install { text, percent -> progress(text, percent) }
+            result.onFailure {
+                val plain = it.message ?: "The tools could not be installed."
+                log("error", plain)
+                toast(plain)
+            }
+            result.onSuccess {
+                c.settings.setToolchainReady(true)
+                refreshTools()
+                toast("Tools are ready.")
+            }
         }
+    }
+
+    // ---------- project ----------
+
+    fun openProject(id: String) {
+        viewModelScope.launch {
+            val project = withContext(Dispatchers.IO) { c.projects.load(id) }
+            if (project == null) {
+                toast("That project could not be found.")
+                return@launch
+            }
+            _ui.update {
+                it.copy(
+                    open = project,
+                    logs = project.logs.takeLast(300),
+                    reportOpen = false,
+                    filter = null,
+                    editorPath = null
+                )
+            }
+        }
+    }
+
+    fun closeProject() = _ui.update {
+        it.copy(open = null, logs = emptyList(), diff = null, editorPath = null, reportOpen = false, filter = null)
+    }
+
+    fun delete(id: String) {
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { c.projects.delete(id) }
+            refreshProjects()
+            toast("Project deleted.")
+        }
+    }
+
+    fun setProjectDryRun(value: Boolean) {
+        val project = _ui.value.open ?: return
+        val updated = project.copy(dryRun = value)
+        _ui.update { it.copy(open = updated) }
+        viewModelScope.launch { c.projects.save(updated) }
+    }
+
+    fun setFilter(category: HitCategory?) = _ui.update { it.copy(filter = category) }
+
+    fun toggleReport() = _ui.update { it.copy(reportOpen = !it.reportOpen) }
+
+    // ---------- pipeline ----------
+
+    fun runPipeline() {
+        val project = _ui.value.open ?: return
+        launchWork("Working on ${project.name}") {
+            log("info", "Run started for ${project.name}")
+            val result = c.pipeline.run(
+                project,
+                { updated -> _ui.update { it.copy(open = updated.copy(logs = it.logs)) } },
+                { text, percent -> progress(text, percent) },
+                { line -> log("tool", line) }
+            )
+            result.onFailure {
+                val plain = it.message ?: "The run stopped."
+                log("error", plain)
+                toast(plain)
+            }
+            result.onSuccess { finished ->
+                val merged = finished.copy(logs = _ui.value.logs)
+                c.projects.save(merged)
+                _ui.update { it.copy(open = merged) }
+                refreshProjects()
+                toast("Finished: ${finished.stage.name.lowercase()}")
+            }
+        }
+    }
+
+    private fun withOpen(block: suspend (Project) -> Unit) {
+        val project = _ui.value.open ?: return
+        launchWork("Working") { block(project) }
+    }
+
+    fun runIntegrity() = withOpen { project ->
+        log("info", "Integrity sweep started")
+        val decode = c.projects.decodeDir(project.id)
+        val (updated, notes) = c.integrity.sweep(project, decode) { log("tool", it) }
+        notes.forEach { log("info", it) }
+        val saved = updated.copy(logs = _ui.value.logs)
+        c.projects.save(saved)
+        _ui.update { it.copy(open = saved) }
+        toast("Integrity sweep done.")
+    }
+
+    fun runBilling() = withOpen { project ->
+        log("info", "Entitlement patch started")
+        val (updated, notes) = c.billing.apply(project) { log("tool", it) }
+        notes.forEach { log("info", it) }
+        val saved = updated.copy(logs = _ui.value.logs)
+        c.projects.save(saved)
+        _ui.update { it.copy(open = saved) }
+        toast("Entitlement patched.")
+    }
+
+    fun repairManifest() = withOpen { project ->
+        val (updated, notes) = c.repairs.repair(project) { log("tool", it) }
+        notes.forEach { log("info", it) }
+        val saved = updated.copy(logs = _ui.value.logs)
+        c.projects.save(saved)
+        _ui.update { it.copy(open = saved) }
+        toast("Manifest repair done.")
+    }
+
+    fun rename(suggestion: String) = withOpen { project ->
+        val target = suggestion.ifBlank { project.packageName }
+        val (updated, note) = c.renamer.rename(project, c.projects.decodeDir(project.id), target) { log("tool", it) }
+        log("info", note)
+        val saved = updated.copy(logs = _ui.value.logs)
+        c.projects.save(saved)
+        _ui.update { it.copy(open = saved) }
+        toast(note)
+    }
+
+    fun rebuild() = withOpen { project ->
+        log("info", "Rebuild started")
+        val decode = c.projects.decodeDir(project.id)
+        if (!decode.isDirectory) {
+            toast("Unpack the app first.")
+            return@withOpen
+        }
+        val result = c.builder.build(project, decode, c.projects.outDir(project.id)) { log("tool", it) }
+        when (result) {
+            is com.arin.bypass.engine.BuildResult.Failure -> {
+                log("error", result.message)
+                toast(result.message)
+            }
+            is com.arin.bypass.engine.BuildResult.Success -> {
+                val saved = project.copy(
+                    outputApk = result.apk.absolutePath,
+                    stage = Stage.REVIEW,
+                    logs = _ui.value.logs
+                )
+                c.projects.save(saved)
+                _ui.update { it.copy(open = saved) }
+                toast("Built and signed.")
+            }
+        }
+    }
+
+    fun patch(findingId: String) = withOpen { project ->
+        val finding = project.findings.firstOrNull { it.id == findingId } ?: return@withOpen
+        val result = c.actions.patch(project, finding)
+        val saved = result.project.copy(logs = _ui.value.logs)
+        c.projects.save(saved)
+        _ui.update {
+            it.copy(
+                open = saved,
+                diff = result.diff.ifBlank { null },
+                diffTitle = result.message
+            )
+        }
+        log("info", result.message)
+        refreshProjects()
+    }
+
+    fun preview(findingId: String) {
+        val project = _ui.value.open ?: return
+        val finding = project.findings.firstOrNull { it.id == findingId } ?: return
+        viewModelScope.launch {
+            val diff = withContext(Dispatchers.IO) { c.actions.preview(project, finding) }
+            _ui.update {
+                it.copy(
+                    diffTitle = finding.title,
+                    diff = diff.ifBlank { "No change is possible for this hit." }
+                )
+            }
+        }
+    }
+
+    fun replaceEndpoint(findingId: String, newUrl: String) = withOpen { project ->
+        val finding = project.findings.firstOrNull { it.id == findingId } ?: return@withOpen
+        val result = c.actions.replaceEndpoint(project, finding, newUrl)
+        val saved = result.project.copy(logs = _ui.value.logs)
+        c.projects.save(saved)
+        _ui.update { it.copy(open = saved, diff = result.diff.ifBlank { null }, diffTitle = result.message) }
+        log("info", result.message)
+    }
+
+    fun dismiss(findingId: String) {
+        val project = _ui.value.open ?: return
+        val updated = project.copy(
+            findings = project.findings.map { if (it.id == findingId) it.copy(dismissed = !it.dismissed) else it }
+        )
+        _ui.update { it.copy(open = updated) }
+        viewModelScope.launch { c.projects.save(updated) }
+    }
+
+    fun revert(patchId: String) = withOpen { project ->
+        val updated = c.patcher.revert(project, patchId)
+        val saved = updated.copy(logs = _ui.value.logs)
+        c.projects.save(saved)
+        _ui.update { it.copy(open = saved) }
+        toast("Patch reverted.")
+    }
+
+    fun revertAll() = withOpen { project ->
+        val updated = c.patcher.revertAll(project)
+        val saved = updated.copy(logs = _ui.value.logs)
+        c.projects.save(saved)
+        _ui.update { it.copy(open = saved) }
+        toast("Every patch reverted.")
+    }
+
+    fun clearDiff() = _ui.update { it.copy(diff = null) }
+
+    // ---------- editor ----------
+
+    fun openFile(path: String) {
+        val project = _ui.value.open ?: return
+        viewModelScope.launch {
+            val decode = c.projects.decodeDir(project.id)
+            val text = withContext(Dispatchers.IO) { runCatching { File(decode, path).readText() }.getOrNull() }
+            if (text == null) {
+                toast("That file could not be opened.")
+                return@launch
+            }
+            val relative = path.substringAfter('/', "")
+            val javaPath = "java/" + relative.removeSuffix(".smali") + ".java"
+            val java = withContext(Dispatchers.IO) {
+                runCatching { File(c.projects.javaDir(project.id), javaPath).readText() }.getOrNull()
+            }
+            _ui.update {
+                it.copy(
+                    editorPath = path,
+                    editorText = text,
+                    javaText = java.orEmpty(),
+                    javaAvailable = java != null
+                )
+            }
+        }
+    }
+
+    fun closeEditor() = _ui.update { it.copy(editorPath = null, editorText = "", javaText = "") }
+
+    fun saveEditor(text: String) {
+        val project = _ui.value.open ?: return
+        val path = _ui.value.editorPath ?: return
+        viewModelScope.launch {
+            val file = File(c.projects.decodeDir(project.id), path)
+            withContext(Dispatchers.IO) { runCatching { file.writeText(text) } }
+            val record = PatchRecord(
+                id = Ids.newId(),
+                title = "Manual edit",
+                file = path,
+                kind = PatchKind.NOTE,
+                diff = "Edited by hand in the editor",
+                appliedAt = System.currentTimeMillis()
+            )
+            val updated = project.copy(patches = project.patches + record, logs = _ui.value.logs)
+            c.projects.save(updated)
+            _ui.update { it.copy(open = updated, editorPath = null, editorText = "", javaText = "") }
+            toast("Saved $path")
+        }
+    }
+
+    // ---------- output ----------
+
+    fun installOutput() {
+        val project = _ui.value.open ?: return
+        val path = project.outputApk
+        if (path == null) {
+            toast("Build the project first.")
+            return
+        }
+        viewModelScope.launch {
+            val result = withContext(Dispatchers.IO) { c.installer.install(File(path)) }
+            result.onFailure { toast(it.message ?: "The installer could not be opened.") }
+            result.onSuccess { toast("Installer opened.") }
+        }
+    }
+
+    fun export() {
+        val project = _ui.value.open ?: return
+        if (project.crashLooping) {
+            toast("The clone still crash-loops, so export is refused.")
+            return
+        }
+        val path = project.outputApk
+        if (path == null) {
+            toast("Build the project first.")
+            return
+        }
+        launchWork("Exporting") {
+            val file = File(path)
+            if (!file.isFile) {
+                toast("The built file is gone, rebuild it first.")
+                return@launchWork
+            }
+            val copy = c.projects.exportCopy(project, file)
+            val updated = project.copy(exported = true, logs = _ui.value.logs)
+            c.projects.save(updated)
+            _ui.update { it.copy(open = updated) }
+            log("info", "Exported to ${copy.absolutePath}")
+            toast("Saved to ${copy.name}")
+        }
+    }
+
+    fun writeReport() {
+        val project = _ui.value.open ?: return
+        launchWork("Writing the report") {
+            val verdict = when {
+                project.crashLooping -> "still broken"
+                project.exported -> "exported"
+                else -> "not installed"
+            }
+            val text = c.reporter.markdown(project.copy(logs = _ui.value.logs), verdict)
+            c.projects.writeReport(project, text)
+            val updated = project.copy(report = text, logs = _ui.value.logs)
+            c.projects.save(updated)
+            _ui.update { it.copy(open = updated, reportOpen = true) }
+            toast("Report written into the project folder.")
+        }
+    }
+
+    // ---------- settings ----------
+
+    fun setDryRun(value: Boolean) {
+        _ui.update { it.copy(settings = it.settings.copy(dryRun = value)) }
+        viewModelScope.launch { c.settings.setDryRun(value) }
     }
 
     fun setRenameClones(value: Boolean) {
-        viewModelScope.launch {
-            container.settings.setRenameClones(value)
-            _state.update { it.copy(settings = it.settings.copy(renameClones = value)) }
-        }
+        _ui.update { it.copy(settings = it.settings.copy(renameClones = value)) }
+        viewModelScope.launch { c.settings.setRenameClones(value) }
     }
 
     fun setAutoScan(value: Boolean) {
-        viewModelScope.launch {
-            container.settings.setAutoScan(value)
-            _state.update { it.copy(settings = it.settings.copy(autoScan = value)) }
-        }
+        _ui.update { it.copy(settings = it.settings.copy(autoScan = value)) }
+        viewModelScope.launch { c.settings.setAutoScan(value) }
     }
 
     fun setRoundLimit(value: Int) {
-        viewModelScope.launch {
-            container.settings.setRoundLimit(value)
-            _state.update { it.copy(settings = it.settings.copy(roundLimit = value.coerceIn(1, 6))) }
-        }
+        _ui.update { it.copy(settings = it.settings.copy(roundLimit = value)) }
+        viewModelScope.launch { c.settings.setRoundLimit(value) }
     }
-}
 
-class BypassViewModelFactory(private val container: AppContainer) : ViewModelProvider.Factory {
-    override fun <T : ViewModel> create(modelClass: Class<T>): T {
-        @Suppress("UNCHECKED_CAST")
-        return BypassViewModel(container) as T
+    companion object {
+        fun factory(container: AppContainer): ViewModelProvider.Factory =
+            object : ViewModelProvider.Factory {
+                @Suppress("UNCHECKED_CAST")
+                override fun <T : ViewModel> create(modelClass: Class<T>): T =
+                    BypassViewModel(container) as T
+            }
     }
 }

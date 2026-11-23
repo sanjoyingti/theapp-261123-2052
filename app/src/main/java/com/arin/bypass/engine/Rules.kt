@@ -18,7 +18,7 @@ object Rules {
         Rule("pin.digest", "Pin digest", "A pinned certificate fingerprint was found next to the code that enforces it.", HitCategory.PINNING, 70, Regex("<pin-digest|sha256/[A-Za-z0-9+/=]{20,}")),
         Rule("pin.trust", "Custom trust manager", "A hand written trust manager decides which certificates are accepted.", HitCategory.PINNING, 65, Regex("checkServerTrusted|X509TrustManager")),
         Rule("pin.netsec", "Network security config", "A network security configuration file controls which certificate authorities are trusted.", HitCategory.PINNING, 60, Regex("network_security_config|networkSecurityConfig")),
-        Rule("pin.mitm", "apk-mitm marker", "This class is one that the pinning remover usually rewrites.", HitCategory.PINNING, 55, Regex("CertificatePinner\\$Builder|TrustManagerFactory")),
+        Rule("pin.mitm", "apk-mitm marker", "This class is one that the pinning remover usually rewrites.", HitCategory.PINNING, 55, Regex("CertificatePinner\\\$Builder|TrustManagerFactory")),
 
         Rule("net.okhttp", "OkHttp call", "Network traffic goes through OkHttp.", HitCategory.NETWORK, 50, Regex("Lokhttp3/|okhttp3\\.(OkHttpClient|Request)")),
         Rule("net.retrofit", "Retrofit call", "The app builds its API calls with Retrofit.", HitCategory.NETWORK, 50, Regex("Lretrofit2/|retrofit2\\.Retrofit")),
@@ -36,7 +36,7 @@ object Rules {
 
         Rule("tok.access", "Access token", "An access token field feeds the requests.", HitCategory.TOKEN, 60, Regex("access_token|accessToken")),
         Rule("tok.refresh", "Refresh token", "A refresh token is stored and used.", HitCategory.TOKEN, 60, Regex("refresh_token|refreshToken")),
-        Rule("tok.jwt", "JWT handling", "A JSON web token is parsed locally.", HitCategory.TOKEN, 55, Regex("jwt|JWT|split\\(\\\"\\\\.\\\"\\)")),
+        Rule("tok.jwt", "JWT handling", "A JSON web token is parsed locally.", HitCategory.TOKEN, 55, Regex("jwt|JWT")),
         Rule("tok.valid", "Token validator", "A method decides whether the stored token is still good.", HitCategory.TOKEN, 65, Regex("isTokenValid|hasValidToken|tokenExpired|isExpired")),
 
         Rule("flag.check", "Feature flag check", "A boolean feature flag switches a feature on or off.", HitCategory.FLAG, 55, Regex("isEnabled|featureFlag|FeatureFlag|isFeatureOn")),
@@ -47,7 +47,7 @@ object Rules {
         Rule("nsfw.mod", "Moderation answer", "The server moderation answer is checked.", HitCategory.NSFW, 55, Regex("moderation|safeSearch|isSafe")),
 
         Rule("upd.force", "Force update check", "The app can block itself until it is updated.", HitCategory.FORCE_UPDATE, 75, Regex("forceUpdate|force_update|updateRequired|mandatoryUpdate")),
-        Rule("upd.min", "Minimum version compare", "A minimum supported version is compared with the installed one.", HitCategory.FORCE_UPDATE, 65, Regex("minVersion|minimumVersion|versionCode <|latestVersion")),
+        Rule("upd.min", "Minimum version compare", "A minimum supported version is compared with the installed one.", HitCategory.FORCE_UPDATE, 65, Regex("minVersion|minimumVersion|latestVersion")),
         Rule("upd.inapp", "In-app update", "Play in-app update flow is wired in.", HitCategory.FORCE_UPDATE, 55, Regex("AppUpdateManager|inAppUpdate")),
 
         Rule("bill.play", "Play Billing", "Google Play Billing is used to sell the subscription.", HitCategory.BILLING, 80, Regex("com/android/billingclient|BillingClient")),
@@ -56,8 +56,8 @@ object Rules {
         Rule("bill.qonv", "Qonversion", "Qonversion keeps the entitlement state.", HitCategory.BILLING, 80, Regex("com/qonversion|Qonversion")),
         Rule("bill.super", "Superwall", "Superwall handles the paywall.", HitCategory.PAYWALL, 80, Regex("com/superwall|Superwall")),
         Rule("bill.homemade", "Hand written premium flag", "A local boolean decides whether the user is premium.", HitCategory.PAYWALL, 70, Regex("isPremium|isPro\\b|hasActiveSub|hasSubscription|isSubscribed")),
-        Rule("bill.plan", "Plan comparison", "The current plan name is compared against a paid plan.", HitCategory.PAYWALL, 65, Regex("plan\\s*==|PRO\\\"|premium\\\"|entitlement")),
-        Rule("bill.seed", "Premium seed value", "A stored default for the premium flag was found.", HitCategory.PAYWALL, 55, Regex("putBoolean\\(\\\"(is_?premium|premium|is_?pro)|\\\"premium\\\":\\s*(true|false)")),
+        Rule("bill.plan", "Plan comparison", "The current plan name is compared against a paid plan.", HitCategory.PAYWALL, 65, Regex("plan\\s*==|entitlement")),
+        Rule("bill.seed", "Premium seed value", "A stored default for the premium flag was found.", HitCategory.PAYWALL, 55, Regex("putBoolean\\(\\\"is_?premium|\\\"premium\\\":\\s*(true|false)|putBoolean\\(\\\"is_?pro")),
         Rule("bill.paywall", "Paywall screen", "A paywall or upgrade screen is present.", HitCategory.PAYWALL, 50, Regex("Paywall|paywall|UpgradeActivity|SubscriptionActivity"))
     )
 

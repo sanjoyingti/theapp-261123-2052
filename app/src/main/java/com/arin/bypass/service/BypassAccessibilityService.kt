@@ -2,33 +2,42 @@ package com.arin.bypass.service
 
 import android.accessibilityservice.AccessibilityService
 import android.view.accessibility.AccessibilityEvent
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
+import android.view.accessibility.AccessibilityNodeInfo
 
-/** Watches window changes only; the repair loop uses this to spot a bounce back to a paywall. */
+/** Only reads the screen text of the app in front so the loop can flag a paywall bounce. */
 class BypassAccessibilityService : AccessibilityService() {
 
-    override fun onServiceConnected() {
-        connected.value = true
-        super.onServiceConnected()
-    }
-
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        val from = event?.packageName?.toString() ?: return
-        if (from == packageName) return
-        last.value = from
+        val source = event ?: return
+        if (source.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
+        val pkg = source.packageName?.toString() ?: return
+        if (pkg == packageName) return
+        lastForeground = pkg
+        lastScreen = runCatching { read(rootInActiveWindow) }.getOrDefault("")
     }
 
     override fun onInterrupt() = Unit
 
-    override fun onDestroy() {
-        connected.value = false
-        super.onDestroy()
+    private fun read(node: AccessibilityNodeInfo?): String {
+        if (node == null) return ""
+        val text = StringBuilder()
+        fun walk(current: AccessibilityNodeInfo, depth: Int) {
+            if (depth > 12) return
+            current.text?.let { text.append(it).append(' ') }
+            current.contentDescription?.let { text.append(it).append(' ') }
+            for (i in 0 until current.childCount) {
+                current.getChild(i)?.let { walk(it, depth + 1) }
+            }
+        }
+        walk(node, 0)
+        return text.toString().take(4000)
     }
 
     companion object {
-        val connected: MutableStateFlow<Boolean> = MutableStateFlow(false)
-        private val last = MutableStateFlow("")
-        val lastForeground: StateFlow<String> get() = last
+        @Volatile
+        var lastForeground: String? = null
+
+        @Volatile
+        var lastScreen: String = ""
     }
 }
