@@ -2,7 +2,6 @@ package com.arin.bypass.viewmodel
 
 import android.content.Intent
 import android.net.Uri
-import android.provider.Settings
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.initializer
@@ -177,20 +176,21 @@ class BypassViewModel(private val container: AppContainer) : ViewModel() {
 
     fun setRoundLimit(value: Int) {
         viewModelScope.launch {
-            container.settings.setRoundLimit(value)
-            _ui.value = _ui.value.copy(settings = _ui.value.settings.copy(roundLimit = value.coerceIn(1, 6)))
+            val clamped = value.coerceIn(1, 6)
+            container.settings.setRoundLimit(clamped)
+            _ui.value = _ui.value.copy(settings = _ui.value.settings.copy(roundLimit = clamped))
         }
     }
 
     fun openInstallPermission() {
         viewModelScope.launch {
             val intent = Intent(
-                Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
                 Uri.parse("package:${container.context.packageName}")
             ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             val opened = runCatching { container.context.startActivity(intent) }.isSuccess
             if (!opened) {
-                val fallback = Intent(Settings.ACTION_SECURITY_SETTINGS)
+                val fallback = Intent(android.provider.Settings.ACTION_SECURITY_SETTINGS)
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 val ok = runCatching { container.context.startActivity(fallback) }.isSuccess
                 if (!ok) {

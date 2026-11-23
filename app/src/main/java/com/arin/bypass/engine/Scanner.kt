@@ -17,68 +17,74 @@ class Scanner {
     private val maxFileBytes = 512L * 1024L
     private val maxFindings = 500
 
-    suspend fun scan(decodeDir: File, javaDir: File, onLog: (String) -> Unit): List<Finding> =
-        withContext(Dispatchers.IO) {
-            val hits = HashMap<String, Finding>()
-            val hosts = HashMap<String, Finding>()
-            var files = 0
+    suspend fun scan(
+        decodeDir: File,
+        javaDir: File,
+        onLog: (String) -> Unit = {}
+    ): List<Finding> = withContext(Dispatchers.IO) {
+        val hits = HashMap<String, Finding>()
+        val hosts = HashMap<String, Finding>()
+        var files = 0
 
-            val smaliDirs = decodeDir.listFiles()?.filter { it.isDirectory && it.name.startsWith("smali") } ?: emptyList()
-            for (dir in smaliDirs) {
-                dir.walkTopDown().forEach { file ->
-                    ensureActive()
-                    if (!file.isFile || !file.name.endsWith(".smali") || file.length() > maxFileBytes) return@forEach
-                    files++
-                    val rel = file.relativeTo(decodeDir).invariantSeparatorsPath
-                    val lines = runCatching { file.readLines() }.getOrNull() ?: return@forEach
-                    lines.forEachIndexed { index, line ->
-                        for (rule in Rules.all) {
-                            if (!rule.pattern.containsMatchIn(line)) continue
-                            val symbol = symbolOf(line)
-                            val key = rule.id + "|" + rel + "|" + symbol
-                            if (hits.containsKey(key)) continue
-                            hits[key] = Finding(
+        val smaliDirs = decodeDir.listFiles()?.filter { it.isDirectory && it.name.startsWith("smali") } ?: emptyList()
+        for (dir in smaliDirs) {
+            dir.walkTopDown().forEach { file ->
+                ensureActive()
+                if (!file.isFile || !file.name.endsWith(".smali") || file.length() > maxFileBytes) return@forEach
+                files++
+                val rel = file.relativeTo(decodeDir).invariantSeparatorsPath
+                val lines = runCatching { file.readLines() }.getOrNull() ?: return@forEach
+                lines.forEachIndexed { index, line ->
+                    for (rule in Rules.all) {
+                        if (!rule.pattern.containsMatchIn(line)) continue
+                        val symbol = symbolOf(line)
+                        val key = rule.id + "|" + rel + "|" + symbol
+                        if (hits.containsKey(key)) continue
+                        hits[key] = Finding(
+                            id = Ids.newId(),
+                            ruleId = rule.id,
+                            title = rule.title,
+                            detail = rule.detail,
+                            category = rule.category,
+                            confidence = rule.weight,
+                            file = rel,
+                            line = index + 1,
+                            snippet = line.trim().take(200),
+                            symbol = symbol
+                        )
+                    }
+                    for (match in Rules.endpoints.findAll(line)) {
+                        val url = match.value
+                        val host = url.substringAfter("://").substringBefore("/").substringBefore(":").removePrefix("www.")
+                        if (host.isBlank() || host.length < 4) continue
+                        hosts.getOrPut(host) {
+                            Finding(
                                 id = Ids.newId(),
-                                ruleId = rule.id,
-                                title = rule.title,
-                                detail = rule.detail,
-                                category = rule.category,
-                                confidence = rule.weight,
+                                ruleId = "endpoint.host",
+                                title = "Endpoint host",
+                                detail = "This app talks to $host.",
+                                category = HitCategory.ENDPOINT,
+                                confidence = 40,
                                 file = rel,
                                 line = index + 1,
-                                snippet = line.trim().take(200),
-                                symbol = symbol
+                                snippet = url,
+                                symbol = ""
                             )
                         }
-                        for (match in Rules.endpoints.findAll(line)) {
-                            val url = match.value
-                            val host = url.substringAfter("://").substringBefore("/").substringBefore(":").removePrefix("www.")
-                            if (host.isBlank() || host.length < 4) continue
-                            hosts.getOrPut(host) {
-                                Finding(
-                                    id = Ids.newId(),
-                                    ruleId = "endpoint.host",
-                                    title = "Endpoint host",
-                                    detail = "This app talks to $host.",
-                                    category = HitCategory.ENDPOINT,
-                                    confidence = 40,
-                                    file = rel,
-                                    line = index + 1,
-                                    snippet = url,
-                                    symbol = ""
-                                )
-                            }
-                        }
                     }
-                    if (hits.size > maxFindings) return@withContext finish(hits, hosts, onLog)
+                }
+                if (hits.size + hosts.size > maxFindings) {
+                    onLog("Enough hits for now, stopping the walk")
+                    return@withContext finish(hits, hosts, onLog)
                 }
             }
+        }
 
-            onLog("Checking the Java view for confirmation")
+        onLog("Checking the Java view for confirmation")
+        if (javaDir.isDirectory) {
             javaDir.walkTopDown().forEach { file ->
                 ensureActive()
                 if (!file.isFile || !file.name.endsWith(".java") || file.length() > maxFileBytes) return@forEach
-                val rel = file.relativeTo(javaDir).invariantSeparatorsPath
                 val text = runCatching { file.readText() }.getOrNull() ?: return@forEach
                 for (rule in Rules.all) {
                     if (!rule.pattern.containsMatchIn(text)) continue
@@ -92,10 +98,11 @@ class Scanner {
                     }
                 }
             }
-
-            onLog("Scanned $files smali files")
-            finish(hits, hosts, onLog)
         }
+
+        onLog("Scanned $files smali files")
+        finish(hits, hosts, onLog)
+    }
 
     private fun finish(hits: Map<String, Finding>, hosts: Map<String, Finding>, onLog: (String) -> Unit): List<Finding> {
         val list = ArrayList<Finding>()
@@ -117,10 +124,17 @@ class Scanner {
         return direct?.groupValues?.get(1) ?: ""
     }
 
-    fun obfuscatedFiles(decodeDir: File): List<String> =
-        decodeDir.walkTopDown()
-            .filter { it.isFile && Rules.obfuscationClass.containsMatchIn(it.relativeTo(decodeDir).invariantSeparatorsPath) }
-            .take(400)
-            .map { it.relativeTo(decodeDir).invariantSeparatorsPath }
-            .toList()
+    fun obfuscatedFiles(decodeDir: File): List<String> {
+        val result = ArrayList<String>()
+        val dirs = decodeDir.listFiles()?.filter { it.isDirectory && it.name.startsWith("smali") } ?: return result
+        for (dir in dirs) {
+            dir.walkTopDown().forEach { file ->
+                if (result.size >= 400) return result
+                if (!file.isFile) return@forEach
+                val rel = file.relativeTo(decodeDir).invariantSeparatorsPath
+                if (Rules.obfuscationClass.containsMatchIn(rel)) result.add(rel)
+            }
+        }
+        return result
+    }
 }
