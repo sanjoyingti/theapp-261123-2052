@@ -3,56 +3,58 @@ package com.arin.bypass.engine
 import com.arin.bypass.model.Project
 import com.arin.bypass.util.Format
 
-/** Writes the per-project markdown report: found, changed, still broken. */
+/** Builds the plain-language markdown report for one project. */
 class Report {
 
-    fun markdown(project: Project, verdict: String): String {
-        val text = StringBuilder()
-        text.append("# Bypass report — ").append(project.name).append("\n\n")
-        text.append("- Package: `").append(project.packageName).append("`\n")
-        project.renameTo?.let { text.append("- Clone package: `").append(it).append("`\n") }
-        text.append("- Version: ").append(project.versionName.ifBlank { "unknown" }).append('\n')
-        text.append("- Started: ").append(Format.day(project.createdAt)).append('\n')
-        text.append("- Untouched original hash: ").append(project.originalSha256).append('\n')
-        text.append("- Working copy hash: ").append(project.workingSha256).append('\n')
-        text.append("- Rounds: ").append(project.rounds).append('\n')
-        text.append("- Verdict: ").append(verdict).append("\n\n")
+    fun markdown(project: Project): String {
+        val out = StringBuilder()
+        out.append("# Bypass report — ").append(project.name).append("\n\n")
+        out.append("- Package: `").append(project.packageName).append("`\n")
+        out.append("- Version: ").append(project.versionName.ifBlank { "unknown" }).append('\n')
+        out.append("- Created: ").append(Format.day(project.createdAt)).append('\n')
+        out.append("- Stage: ").append(project.stage.name).append('\n')
+        out.append("- Dry run: ").append(if (project.dryRun) "yes" else "no").append('\n')
+        out.append("- Rounds used: ").append(project.rounds).append('\n')
+        out.append("- Original fingerprint: ").append(Format.sha(project.originalSha256)).append("\n\n")
 
-        text.append("## Found\n\n")
+        out.append("## Found (").append(project.findings.size).append(")\n\n")
         if (project.findings.isEmpty()) {
-            text.append("Nothing was detected.\n")
+            out.append("- Nothing detected.\n")
         } else {
-            project.findings.sortedByDescending { it.confidence }.forEach { hit ->
-                text.append("- [").append(hit.confidence).append("%] ").append(hit.title)
-                text.append(" — `").append(hit.file).append('`')
-                if (hit.line > 0) text.append(" line ").append(hit.line)
-                if (hit.patched) text.append(" (patched)") else if (hit.dismissed) text.append(" (dismissed)")
-                text.append('\n')
+            for (finding in project.findings.sortedByDescending { it.confidence }) {
+                out.append("- **").append(finding.title).append("** (")
+                    .append(finding.category.name).append(", ")
+                    .append(finding.confidence).append("%) at `")
+                    .append(finding.file).append(':').append(finding.line).append('`')
+                if (finding.patched) out.append(" — patched")
+                if (finding.dismissed) out.append(" — dismissed")
+                out.append('\n')
             }
         }
 
-        text.append("\n## Changed\n\n")
-        val applied = project.patches.filter { !it.reverted }
-        if (applied.isEmpty()) {
-            text.append("No change was applied.\n")
+        out.append("\n## Changed (").append(project.patches.count { !it.reverted }).append(")\n\n")
+        if (project.patches.isEmpty()) {
+            out.append("- Nothing changed yet.\n")
         } else {
-            applied.forEach { patch ->
-                text.append("### ").append(patch.title).append(" — `").append(patch.file).append("`\n\n")
-                text.append("```diff\n").append(patch.diff).append("```\n\n")
+            for (patch in project.patches) {
+                out.append("- ")
+                if (patch.reverted) out.append("~~reverted~~ ") else out.append("applied ")
+                out.append(patch.title).append(" in `").append(patch.file).append("`\n")
             }
         }
-        val undone = project.patches.count { it.reverted }
-        if (undone > 0) text.append(undone).append(" patch(es) were reverted.\n")
 
-        text.append("\n## Still broken\n\n")
-        if (project.stillBroken.isEmpty()) text.append("Nothing known.\n")
-        else project.stillBroken.forEach { text.append("- ").append(it).append('\n') }
-
-        text.append("\n## Log (last 80 lines)\n\n```\n")
-        project.logs.takeLast(80).forEach { line ->
-            text.append(Format.time(line.time)).append(' ').append(line.level).append(": ").append(line.message).append('\n')
+        out.append("\n## Still broken\n\n")
+        if (project.stillBroken.isEmpty()) {
+            out.append("- Nothing known right now.\n")
+        } else {
+            for (item in project.stillBroken) out.append("- ").append(item).append('\n')
         }
-        text.append("```\n")
-        return text.toString()
+
+        out.append("\n## Log tail\n\n```\n")
+        for (line in project.logs.takeLast(60)) {
+            out.append(Format.time(line.time)).append(' ').append(line.level).append(' ').append(line.message).append('\n')
+        }
+        out.append("```\n")
+        return out.toString()
     }
 }

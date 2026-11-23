@@ -2,11 +2,8 @@ package com.arin.bypass.ui.screens
 
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -18,19 +15,28 @@ import androidx.compose.material3.DrawerState
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.navigation.NavController
-import com.arin.bypass.engine.Shell
-import com.arin.bypass.ui.components.WorkProgress
 import com.arin.bypass.viewmodel.BypassViewModel
 import kotlinx.coroutines.launch
-import androidx.compose.runtime.rememberCoroutineScope
+
+private val toolList = listOf(
+    "apktool" to "Unpacks and repackages the app",
+    "JADX" to "Writes the readable Java view",
+    "apk-mitm helper" to "Relaxes certificate pinning",
+    "APKEditor" to "Repairs split archives",
+    "uber-apk-signer" to "Fallback signer",
+    "keytool" to "Makes one signing key per project"
+)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -41,7 +47,6 @@ fun ToolsScreen(
     drawer: DrawerState
 ) {
     val scope = rememberCoroutineScope()
-    val tools = listOf("java", "keytool", "apktool", "jadx", "zipalign", "apksigner", "uber-apk-signer")
 
     Scaffold(
         topBar = {
@@ -56,49 +61,51 @@ fun ToolsScreen(
         }
     ) { padding ->
         Column(
-            Modifier.padding(padding).fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp)
+            Modifier.padding(padding).fillMaxSize().verticalScroll(rememberScrollState()).padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            Text(
-                "Everything here is installed once and is not downloaded again. Nothing runs on the main thread.",
-                style = MaterialTheme.typography.bodySmall
-            )
-            Spacer(Modifier.height(12.dp))
-            Button(onClick = { vm.installTools() }, enabled = !state.busy, modifier = Modifier.fillMaxWidth()) {
-                Text(if (state.toolsReady) "Check and repair the tools" else "Install all tools")
-            }
-            if (state.busy) {
-                Spacer(Modifier.height(12.dp))
-                WorkProgress(state.progressText, state.progress)
-            }
-            Spacer(Modifier.height(16.dp))
-            for (tool in tools) {
-                val path = Shell.which(tool)
-                Card(Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
-                    Row(Modifier.padding(12.dp)) {
-                        Column(Modifier.weight(1f)) {
-                            Text(tool, style = MaterialTheme.typography.titleMedium)
-                            Text(
-                                path ?: "not present",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = if (path == null) MaterialTheme.colorScheme.error
-                                else MaterialTheme.colorScheme.primary
-                            )
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text(
+                        if (state.toolsReady) "The helper programs are installed." else "The helper programs are not ready yet.",
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                    Text(
+                        "Setup runs once and is skipped next time. Everything runs in the background, so the screen stays usable.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    if (state.busy) {
+                        LinearProgressIndicator(
+                            progress = { state.progress / 100f },
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Text(state.progressText, style = MaterialTheme.typography.bodySmall)
+                        OutlinedButton(onClick = { vm.cancel() }) { Text("Cancel") }
+                    } else {
+                        Button(onClick = { vm.installTools() }) {
+                            Text(if (state.toolsReady) "Check and repair tools" else "Install tools")
                         }
                     }
                 }
             }
-            Spacer(Modifier.height(16.dp))
-            Text(
-                "A signing key is made per project on first build, so two clones never share a key.",
-                style = MaterialTheme.typography.bodySmall
-            )
-            Spacer(Modifier.height(8.dp))
-            Text(
-                "Folder: ${state.settings.let { "" }}${Shell.binDir?.absolutePath ?: "not ready"}",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            Spacer(Modifier.height(24.dp))
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("What is needed", style = MaterialTheme.typography.titleMedium)
+                    toolList.forEach { (name, why) ->
+                        Text("• $name — $why", style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+            }
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("Installing the finished clone", style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        "The phone must allow this app to install unknown apps. Tap below to open the switch.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    OutlinedButton(onClick = { vm.openInstallPermission() }) { Text("Open install permission") }
+                }
+            }
         }
     }
 }

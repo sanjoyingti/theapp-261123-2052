@@ -2,42 +2,72 @@ package com.arin.bypass.service
 
 import android.accessibilityservice.AccessibilityService
 import android.view.accessibility.AccessibilityEvent
-import android.view.accessibility.AccessibilityNodeInfo
 
-/** Only reads the screen text of the app in front so the loop can flag a paywall bounce. */
+/**
+ * Reads the on-screen text of the launched clone. Used only by the repair loop to
+ * tell a paywall redirect or a spinner apart from a healthy start.
+ */
 class BypassAccessibilityService : AccessibilityService() {
 
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        instance = this
+    }
+
+    override fun onDestroy() {
+        if (instance === this) instance = null
+        super.onDestroy()
+    }
+
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        val source = event ?: return
-        if (source.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
-        val pkg = source.packageName?.toString() ?: return
-        if (pkg == packageName) return
-        lastForeground = pkg
-        lastScreen = runCatching { read(rootInActiveWindow) }.getOrDefault("")
+        val event = event ?: return
+        val builder = StringBuilder()
+        event.text?.forEach { builder.append(it).append(' ') }
+        val content = event.contentDescription
+        if (!content.isNullOrBlank()) builder.append(content)
+        val text = builder.toString()
+        if (text.isBlank()) return
+        lastText = text.lowercase()
+        lastAt = System.currentTimeMillis()
     }
 
     override fun onInterrupt() = Unit
 
-    private fun read(node: AccessibilityNodeInfo?): String {
-        if (node == null) return ""
-        val text = StringBuilder()
-        fun walk(current: AccessibilityNodeInfo, depth: Int) {
-            if (depth > 12) return
-            current.text?.let { text.append(it).append(' ') }
-            current.contentDescription?.let { text.append(it).append(' ') }
-            for (i in 0 until current.childCount) {
-                current.getChild(i)?.let { walk(it, depth + 1) }
-            }
-        }
-        walk(node, 0)
-        return text.toString().take(4000)
-    }
-
     companion object {
         @Volatile
-        var lastForeground: String? = null
+        private var instance: BypassAccessibilityService? = null
 
         @Volatile
-        var lastScreen: String = ""
+        var lastText: String = ""
+
+        @Volatile
+        var lastAt: Long = 0
+
+        private val paywallMarks = listOf(
+            "subscribe", "upgrade to", "go premium", "start free trial", "restore purchase", "paywall", "unlock"
+        )
+        private val spinnerMarks = listOf("please wait", "loading", "connecting", "checking")
+
+        val running: Boolean get() = instance != null
+
+        fun freshText(maxAgeMillis: Long = 20_000): String {
+            if (System.currentTimeMillis() - lastAt > maxAgeMillis) return ""
+            return lastText
+        }
+
+        fun looksLikePaywall(): Boolean {
+            val text = freshText()
+            return text.isNotBlank() && paywallMarks.any { text.contains(it) }
+        }
+
+        fun looksStuck(): Boolean {
+            val text = freshText()
+            return text.isNotBlank() && spinnerMarks.any { text.contains(it) }
+        }
+
+        fun forget() {
+            lastText = ""
+            lastAt = 0
+        }
     }
 }
