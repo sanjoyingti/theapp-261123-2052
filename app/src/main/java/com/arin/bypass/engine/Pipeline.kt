@@ -149,7 +149,7 @@ class Pipeline(private val container: AppContainer) {
             progress("Rebuilding the app", 10)
             log("Rebuilding the app")
             val outDir = container.projects.outDir(project.id)
-            val result = container.rebuilder.build(
+            val result: BuildResult = container.builder.build(
                 project, container.projects.decodeDir(project.id), outDir
             ) { text -> log(text) }
             when (result) {

@@ -63,8 +63,8 @@ class Patcher(private val store: ProjectStore) {
         val copy = backup(project, relPath)
         if (!copy.exists()) copy.writeBytes(before)
         file.writeBytes(after)
-        val oldView = runCatching { Axml.summary(before) }.getOrDefault("(binary)")
-        val newView = runCatching { Axml.summary(after) }.getOrDefault("(binary)")
+        val oldView = describe(before)
+        val newView = describe(after)
         PatchRecord(
             id = Ids.newId(),
             findingId = findingId,
@@ -91,7 +91,7 @@ class Patcher(private val store: ProjectStore) {
             title = title,
             file = relPath,
             kind = PatchKind.NETSEC_XML,
-            diff = Diff.unified(relPath, "", String(content).split("\n").joinToString("\n")),
+            diff = Diff.unified(relPath, "", String(content)),
             appliedAt = System.currentTimeMillis()
         )
     }
@@ -126,4 +126,20 @@ class Patcher(private val store: ProjectStore) {
         val after = transform(before) ?: return ""
         return Diff.unified(relPath, before, after)
     }
+
+    /** Renders a binary manifest as readable lines so its diff can be shown. */
+    private fun describe(bytes: ByteArray): String = runCatching {
+        val doc = Axml.parse(bytes)
+        val out = StringBuilder()
+        fun walk(element: Axml.Element, depth: Int) {
+            out.append("  ".repeat(depth)).append('<').append(element.name)
+            for (attr in element.attrs) {
+                out.append(' ').append(attr.name).append("=\"").append(attr.raw ?: attr.data.toString()).append('"')
+            }
+            out.append(">\n")
+            for (child in element.children) walk(child, depth + 1)
+        }
+        walk(doc.manifest(), 0)
+        out.toString()
+    }.getOrElse { "(binary, ${bytes.size} bytes)" }
 }

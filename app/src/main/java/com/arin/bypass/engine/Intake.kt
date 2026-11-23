@@ -69,11 +69,15 @@ class Intake(private val context: Context, private val store: ProjectStore) {
                 }
             }
 
-            if (!ZipKit.isApk(baseApk)) return@withContext Result.failure(Exception("That file has no AndroidManifest.xml, so it is not an installable app."))
+            if (!ZipKit.isApk(baseApk)) {
+                return@withContext Result.failure(Exception("That file has no AndroidManifest.xml, so it is not an installable app."))
+            }
 
             val manifest = Axml.parse(ZipKit.read(baseApk, "AndroidManifest.xml") ?: ByteArray(0))
             val packageName = manifest.manifest().stringValue(null, "package") ?: packageHint
-            if (packageName.isBlank()) return@withContext Result.failure(Exception("The package name could not be read from the manifest."))
+            if (packageName.isBlank()) {
+                return@withContext Result.failure(Exception("The package name could not be read from the manifest."))
+            }
             val versionName = manifest.manifest().stringValue(Axml.ANDROID_NS, "versionName") ?: versionHint
 
             val missing = missingSplits(splits)
@@ -104,8 +108,9 @@ class Intake(private val context: Context, private val store: ProjectStore) {
             val splits = app.splitSourceDirs?.map { File(it).name } ?: emptyList()
             val missing = missingSplits(splits)
             if (missing.isNotEmpty()) onLog("Warning: split parts seem missing: ${missing.joinToString(", ")}")
+            val label = runCatching { app.loadLabel(context.packageManager).toString() }.getOrDefault(packageName)
             val project = newProject(
-                name = info.applicationInfo.loadLabel(context.packageManager).toString(),
+                name = label.ifBlank { packageName },
                 packageName = packageName,
                 versionName = info.versionName ?: "",
                 sourceKind = "installed",
@@ -120,7 +125,7 @@ class Intake(private val context: Context, private val store: ProjectStore) {
         }
     }
 
-    private fun newProject(
+    private suspend fun newProject(
         name: String,
         packageName: String,
         versionName: String,
@@ -130,25 +135,28 @@ class Intake(private val context: Context, private val store: ProjectStore) {
         baseApk: File
     ): Project {
         val id = Ids.newId()
+        val created = System.currentTimeMillis()
         val project = Project(
             id = id,
             name = name,
             packageName = packageName,
             versionName = versionName,
             sourceKind = sourceKind,
-            createdAt = System.currentTimeMillis(),
-            updatedAt = System.currentTimeMillis(),
+            createdAt = created,
+            updatedAt = created,
             stage = Stage.INTAKE,
             splitsPresent = splits.take(60),
             missingSplits = missing
         )
-        // untouched original first, then a working copy
+        // byte-identical untouched original first, then the working copy
         baseApk.copyTo(store.originalFile(project), overwrite = true)
-        store.workingFile(project).also { baseApk.copyTo(it, overwrite = true) }
-        project.copy(
+        baseApk.copyTo(store.workingFile(project), overwrite = true)
+        val saved = project.copy(
             originalSha256 = Hashing.sha256File(store.originalFile(project)),
             workingSha256 = Hashing.sha256File(store.workingFile(project))
-        ).also { runCatching { kotlinx.coroutines.runBlocking { store.save(it) } } }
+        )
+        store.save(saved)
+        return saved
     }
 
     private fun missingSplits(splits: List<String>): List<String> {
