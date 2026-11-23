@@ -1,4 +1,3 @@
-=== ABOUT: Starts a rebuilt clone, watches it, and asks for one fix round when it dies or stalls ===
 package com.arin.bypass.engine
 
 import android.content.Context
@@ -35,7 +34,10 @@ class RepairLoop(private val context: Context, private val installer: Installer)
                 val foreground = ProcessHelper.foregroundPackage(context)
                 if (foreground.isNotEmpty() && foreground != packageName) {
                     onLog("The screen went back to $foreground, which looks like a paywall bounce.")
-                    return@withContext Outcome(false, "The app jumped back to another screen, which looks like a paywall bounce.")
+                    return@withContext Outcome(
+                        false,
+                        "The app jumped back to another screen, which looks like a paywall bounce."
+                    )
                 }
                 onLog("Clone looks healthy")
                 Outcome(true, "The clone stayed open.")

@@ -1,4 +1,3 @@
-=== ABOUT: Opens the rebuilt app in the phone's installer and watches whether the clone is still running ===
 package com.arin.bypass.engine
 
 import android.content.Context
@@ -24,14 +23,21 @@ class Installer(private val context: Context) {
         }
     }
 
+    fun canInstall(): Boolean = runCatching {
+        Build.VERSION.SDK_INT >= 26 && context.packageManager.canRequestPackageInstalls()
+    }.getOrDefault(false)
+
     suspend fun install(apk: File): Result<Unit> = withContext(Dispatchers.Main) {
         try {
+            if (!canInstall()) {
+                return@withContext Result.failure(
+                    Exception("Install permission is off. Allow installing unknown apps for APK Bypass in Settings.")
+                )
+            }
             context.startActivity(installIntent(apk))
             Result.success(Unit)
         } catch (e: Exception) {
-            Result.failure(Exception(Trouble.plain(if (Build.VERSION.SDK_INT >= 26 ||
-                context.packageManager.canRequestPackageInstalls()
-            ) e else Exception("Install permission is off. Allow installing unknown apps for APK Bypass in Settings.")))
+            Result.failure(Exception(Trouble.plain(e)))
         }
     }
 
@@ -53,12 +59,13 @@ class Installer(private val context: Context) {
         withContext(Dispatchers.IO) {
             var seenAlive = false
             val started = System.currentTimeMillis()
-            var foreground = false
             while (System.currentTimeMillis() - started < maxMillis) {
                 val alive = isProcessAlive(packageName)
-                if (alive) seenAlive = true
-                if (alive && !seenAlive) foreground = true
-                if (!alive && seenAlive) return@withContext WatchResult.DIED
+                if (alive) {
+                    seenAlive = true
+                } else if (seenAlive) {
+                    return@withContext WatchResult.DIED
+                }
                 delay(700)
             }
             if (seenAlive) WatchResult.ALIVE else WatchResult.NEVER_STARTED

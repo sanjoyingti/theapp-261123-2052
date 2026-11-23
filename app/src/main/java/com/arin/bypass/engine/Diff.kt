@@ -3,65 +3,60 @@ package com.arin.bypass.engine
 /** Small unified-diff writer used for every preview and every ledger entry. */
 object Diff {
 
+    private class Op(val tag: Char, val text: String, val oldNo: Int, val newNo: Int)
+
     fun unified(path: String, oldText: String, newText: String, context: Int = 3): String {
         if (oldText == newText) return ""
         val old = oldText.split("\n")
         val new = newText.split("\n")
-        var prefix = 0
-        while (prefix < old.size && prefix < new.size && old[prefix] == new[prefix]) prefix++
-        var suffix = 0
-        while (suffix < old.size - prefix && suffix < new.size - prefix &&
-            old[old.size - 1 - suffix] == new[new.size - 1 - suffix]
-        ) suffix++
-
-        val oldMid = old.subList(prefix, old.size - suffix)
-        val newMid = new.subList(prefix, new.size - suffix)
-        val ops = if (oldMid.size * newMid.size <= 1_000_000) lcs(oldMid, newMid)
-        else listOf(Op(' ', -1, -1)).let { _ ->
-            oldMid.map { Op('-', it, -1) } + newMid.map { Op('+', -1, it) }
+        val ops = if (old.size.toLong() * new.size.toLong() <= 2_000_000L) {
+            lcs(old, new)
+        } else {
+            wholeFile(old, new)
         }
 
-        val builder = StringBuilder()
-        builder.append("--- a/").append(path).append('\n')
-        builder.append("+++ b/").append(path).append('\n')
-        var oldLine = 1
-        var newLine = 1
+        val out = StringBuilder()
+        out.append("--- a/").append(path).append('\n')
+        out.append("+++ b/").append(path).append('\n')
+
         var i = 0
         while (i < ops.size) {
             if (ops[i].tag == ' ') {
-                oldLine++
-                newLine++
                 i++
                 continue
             }
+            var start = i
+            var lead = 0
+            while (start > 0 && ops[start - 1].tag == ' ' && lead < context) {
+                start--
+                lead++
+            }
             var end = i
             while (end < ops.size && ops[end].tag != ' ') end++
-            val hunkOldStart = oldLine
-            val hunkNewStart = newLine
+            var after = end
+            var trail = 0
+            while (after < ops.size && ops[after].tag == ' ' && trail < context) {
+                after++
+                trail++
+            }
+
             var removed = 0
             var added = 0
-            val body = StringBuilder()
-            for (k in i until end) {
-                val op = ops[k]
-                if (op.tag == '-') {
-                    body.append('-').append(op.oldLine).append('\n')
-                    removed++
-                    oldLine++
-                } else {
-                    body.append('+').append(op.newLine).append('\n')
-                    added++
-                    newLine++
-                }
+            for (k in start until after) {
+                if (ops[k].tag == '-') removed++
+                if (ops[k].tag == '+') added++
             }
-            builder.append("@@ -").append(hunkOldStart).append(',').append(removed)
-                .append(" +").append(hunkNewStart).append(',').append(added).append(" @@").append('\n')
-            builder.append(body)
-            i = end
-        }
-        return builder.toString()
-    }
 
-    private class Op(val tag: Char, val oldLine: Int, val newLine: Int)
+            out.append("@@ -").append(ops[start].oldNo).append(',').append(removed)
+                .append(" +").append(ops[start].newNo).append(',').append(added).append(" @@")
+                .append('\n')
+            for (k in start until after) {
+                out.append(ops[k].tag).append(ops[k].text).append('\n')
+            }
+            i = after
+        }
+        return out.toString()
+    }
 
     private fun lcs(a: List<String>, b: List<String>): List<Op> {
         val n = a.size
@@ -79,28 +74,35 @@ object Diff {
         while (i < n && j < m) {
             when {
                 a[i] == b[j] -> {
-                    out.add(Op(' ', i + 1, j + 1))
+                    out.add(Op(' ', a[i], i + 1, j + 1))
                     i++
                     j++
                 }
                 table[i + 1][j] >= table[i][j + 1] -> {
-                    out.add(Op('-', i + 1, -1))
+                    out.add(Op('-', a[i], i + 1, j + 1))
                     i++
                 }
                 else -> {
-                    out.add(Op('+', -1, j + 1))
+                    out.add(Op('+', b[j], i + 1, j + 1))
                     j++
                 }
             }
         }
         while (i < n) {
-            out.add(Op('-', i + 1, -1))
+            out.add(Op('-', a[i], i + 1, j + 1))
             i++
         }
         while (j < m) {
-            out.add(Op('+', -1, j + 1))
+            out.add(Op('+', b[j], i + 1, j + 1))
             j++
         }
+        return out
+    }
+
+    private fun wholeFile(a: List<String>, b: List<String>): List<Op> {
+        val out = ArrayList<Op>(a.size + b.size)
+        for (i in a.indices) out.add(Op('-', a[i], i + 1, 1))
+        for (j in b.indices) out.add(Op('+', b[j], a.size + 1, j + 1))
         return out
     }
 }
