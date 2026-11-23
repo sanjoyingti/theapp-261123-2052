@@ -18,7 +18,8 @@ class ForegroundSyncService : Service() {
     override fun onCreate() {
         super.onCreate()
         val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        val channel = NotificationChannel(CHANNEL, getString(R.string.sync_channel), NotificationManager.IMPORTANCE_LOW)
+        val channel = NotificationChannel(CHANNEL, "Bypass work", NotificationManager.IMPORTANCE_LOW)
+        channel.description = "Keeps unpacking and rebuilding running while you are away."
         channel.setShowBadge(false)
         manager.createNotificationChannel(channel)
     }
@@ -30,8 +31,8 @@ class ForegroundSyncService : Service() {
 
     private fun build(): Notification =
         NotificationCompat.Builder(this, CHANNEL)
-            .setContentTitle(getString(R.string.app_name))
-            .setContentText(getString(R.string.sync_text))
+            .setContentTitle("APK Bypass")
+            .setContentText("Working on your project in the background")
             .setSmallIcon(R.drawable.ic_launcher)
             .setOngoing(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)

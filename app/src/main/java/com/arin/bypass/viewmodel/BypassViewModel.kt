@@ -1,6 +1,8 @@
 package com.arin.bypass.viewmodel
 
+import android.content.Intent
 import android.net.Uri
+import android.provider.Settings
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.initializer
@@ -180,6 +182,26 @@ class BypassViewModel(private val container: AppContainer) : ViewModel() {
         }
     }
 
+    fun openInstallPermission() {
+        viewModelScope.launch {
+            val intent = Intent(
+                Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                Uri.parse("package:${container.context.packageName}")
+            ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            val opened = runCatching { container.context.startActivity(intent) }.isSuccess
+            if (!opened) {
+                val fallback = Intent(Settings.ACTION_SECURITY_SETTINGS)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                val ok = runCatching { container.context.startActivity(fallback) }.isSuccess
+                if (!ok) {
+                    _ui.value = _ui.value.copy(
+                        message = "The settings screen could not be opened. Open Settings → Apps → special access → install unknown apps yourself."
+                    )
+                }
+            }
+        }
+    }
+
     fun installTools() {
         startWork("Installing the helper programs") {
             val result = container.toolchain.install { message, percent ->
@@ -187,7 +209,9 @@ class BypassViewModel(private val container: AppContainer) : ViewModel() {
                 addLog("tool", message)
             }
             if (result.isFailure) {
-                _ui.value = _ui.value.copy(message = Trouble.plain(result.exceptionOrNull()))
+                _ui.value = _ui.value.copy(
+                    message = Trouble.plain(result.exceptionOrNull() ?: Exception("The tools could not be installed."))
+                )
             } else {
                 container.settings.setToolchainReady(true)
                 _ui.value = _ui.value.copy(toolsReady = true, message = "Tools are ready.")
@@ -349,7 +373,11 @@ class BypassViewModel(private val container: AppContainer) : ViewModel() {
 
                 val installerResult = container.installer.install(pair.second)
                 if (installerResult.isFailure) {
-                    _ui.value = _ui.value.copy(message = Trouble.plain(installerResult.exceptionOrNull()))
+                    _ui.value = _ui.value.copy(
+                        message = Trouble.plain(
+                            installerResult.exceptionOrNull() ?: Exception("The installer did not open.")
+                        )
+                    )
                     return@startWork
                 }
                 val target = current.renameTo ?: current.packageName

@@ -3,7 +3,7 @@ package com.arin.bypass.util
 /** Every error shown in the app goes through here so nobody ever sees a stack trace. */
 object Trouble {
 
-    fun plain(t: Throwable): String = plain(t.message)
+    fun plain(t: Throwable?): String = plain(t?.message)
 
     fun plain(message: String?): String {
         val raw = message?.trim().orEmpty()
