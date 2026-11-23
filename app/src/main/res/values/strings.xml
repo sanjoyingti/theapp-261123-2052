@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">APK Bypass</string>
+    <string name="accessibility_label">APK Bypass watcher</string>
+    <string name="accessibility_description">Watches a launched clone so the repair loop can notice a crash, a paywall bounce or a stuck spinner.</string>
+</resources>
