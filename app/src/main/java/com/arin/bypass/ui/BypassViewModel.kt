@@ -56,10 +56,14 @@ class BypassViewModel(private val container: AppContainer) : ViewModel() {
     init {
         viewModelScope.launch {
             refresh()
-            val recent = withContext(Dispatchers.IO) {
-                runCatching { container.projects.list().firstOrNull() }.getOrNull()
+            val remembered = withContext(Dispatchers.IO) {
+                runCatching { container.settings.lastProject() }.getOrNull()
             }
-            if (recent != null && _state.value.open == null) open(recent.id)
+            val fallback = withContext(Dispatchers.IO) {
+                runCatching { container.projects.list().firstOrNull()?.id }.getOrNull()
+            }
+            val target = remembered ?: fallback
+            if (target != null && _state.value.open == null) open(target)
         }
     }
 
@@ -75,6 +79,9 @@ class BypassViewModel(private val container: AppContainer) : ViewModel() {
                 runCatching { container.toolchain.ready() }.getOrDefault(false)
             }
             val watcher = runCatching { container.watcher.isEnabled(container.context) }.getOrDefault(false)
+            val port = withContext(Dispatchers.IO) {
+                runCatching { container.settings.port(_state.value.port) }.getOrDefault(_state.value.port)
+            }
             _state.update {
                 it.copy(
                     loading = false,
@@ -82,7 +89,8 @@ class BypassViewModel(private val container: AppContainer) : ViewModel() {
                     settings = settings,
                     toolsReady = ready,
                     watcherOn = watcher,
-                    mockRunning = container.mock.running
+                    mockRunning = container.mock.running,
+                    port = port
                 )
             }
         }
@@ -95,8 +103,10 @@ class BypassViewModel(private val container: AppContainer) : ViewModel() {
     fun setPort(port: Int) {
         val safe = port.coerceIn(1024, 65535)
         _state.update { it.copy(port = safe) }
-        runCatching { container.bypass.setPort(safe) }
-            .onFailure { CrashLog.write("save port", it) }
+        viewModelScope.launch {
+            runCatching { container.settings.setPort(safe) }
+                .onFailure { CrashLog.write("save port", it) }
+        }
     }
 
     // ---- projects ----
@@ -134,7 +144,7 @@ class BypassViewModel(private val container: AppContainer) : ViewModel() {
                 _state.update { it.copy(error = "That project could not be read.") }
                 return@launch
             }
-            runCatching { container.bypass.setLastProject(id) }
+            runCatching { container.settings.setLastProject(id) }
                 .onFailure { CrashLog.write("save last project", it) }
             _state.update { it.copy(open = project, preview = "") }
         }
@@ -207,20 +217,26 @@ class BypassViewModel(private val container: AppContainer) : ViewModel() {
         _state.update { it.copy(error = Trouble.plain(t), busy = false, progressLabel = "") }
     }
 
-    fun decode() = run("Unpacking") { project, log ->
-        container.pipeline.decode(project, log).getOrElse { throw it }
+    /**
+     * Unpacking and scanning happen in one engine step, so this button and the scan
+     * button both drive it; whichever one is pressed gives a full, fresh picture.
+     */
+    fun decode() = run("Unpacking and scanning") { project, log ->
+        container.pipeline.prepare(project, log).getOrElse { throw it }
     }
 
     fun scan() = run("Scanning") { project, log ->
-        container.pipeline.scan(project, log).getOrElse { throw it }
+        container.pipeline.prepare(project, log).getOrElse { throw it }
     }
 
     fun sweep() = run("Integrity sweep") { project, log ->
-        container.pipeline.sweep(project, log).getOrElse { throw it }
+        val prepared = container.pipeline.prepare(project, log).getOrElse { throw it }
+        _state.update { it.copy(notice = "The integrity checks run while unpacking and scanning.") }
+        prepared
     }
 
     fun applyBilling() = run("Billing patch") { project, log ->
-        container.pipeline.applyBilling(project, log).getOrElse { throw it }
+        container.pipeline.patchAll(project, HitCategory.BILLING, log).getOrElse { throw it }
     }
 
     fun repairManifest() = run("Manifest repair") { project, log ->
