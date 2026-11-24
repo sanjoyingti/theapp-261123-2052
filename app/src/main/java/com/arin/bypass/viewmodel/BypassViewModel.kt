@@ -9,7 +9,7 @@ import androidx.lifecycle.viewmodel.viewModelFactory
 import com.arin.bypass.data.AppContainer
 import com.arin.bypass.engine.Diff
 import com.arin.bypass.engine.InstalledReader
-import com.arin.bypass.engine.RepairLoop
+import com.arin.bypass.engine.Pipeline
 import com.arin.bypass.model.Finding
 import com.arin.bypass.model.InstalledApp
 import com.arin.bypass.model.LogLine
@@ -25,8 +25,11 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.lang.reflect.Method
+import kotlin.coroutines.Continuation
 
 class BypassViewModel(private val container: AppContainer) : ViewModel() {
 
@@ -55,9 +58,10 @@ class BypassViewModel(private val container: AppContainer) : ViewModel() {
 
     init {
         viewModelScope.launch {
-            val settings = container.settings.read()
-            val list = withContext(Dispatchers.IO) { container.projects.list() }
-            _ui.value = _ui.value.copy(settings = settings, projects = list, toolsReady = container.toolchain.ready())
+            val settings = runCatching { container.settings.read() }.getOrDefault(Settings())
+            val list = withContext(Dispatchers.IO) { runCatching { container.projects.list() }.getOrDefault(emptyList()) }
+            val ready = withContext(Dispatchers.IO) { runCatching { container.toolchain.ready() }.getOrDefault(false) }
+            _ui.value = _ui.value.copy(settings = settings, projects = list, toolsReady = ready)
         }
     }
 
@@ -82,14 +86,14 @@ class BypassViewModel(private val container: AppContainer) : ViewModel() {
 
     private suspend fun persist(project: Project) {
         val withLogs = project.copy(logs = _ui.value.logs.takeLast(400), updatedAt = System.currentTimeMillis())
-        withContext(Dispatchers.IO) { container.projects.save(withLogs) }
+        withContext(Dispatchers.IO) { runCatching { container.projects.save(withLogs) } }
         _ui.value = _ui.value.copy(current = withLogs)
         refresh()
     }
 
     fun refresh() {
         viewModelScope.launch {
-            val list = withContext(Dispatchers.IO) { container.projects.list() }
+            val list = withContext(Dispatchers.IO) { runCatching { container.projects.list() }.getOrDefault(emptyList()) }
             _ui.value = _ui.value.copy(projects = list)
         }
     }
@@ -98,7 +102,9 @@ class BypassViewModel(private val container: AppContainer) : ViewModel() {
         if (_ui.value.loadingApps) return
         viewModelScope.launch {
             _ui.value = _ui.value.copy(loadingApps = true)
-            val list = withContext(Dispatchers.IO) { InstalledReader.list(container.context) }
+            val list = withContext(Dispatchers.IO) {
+                runCatching { InstalledReader.list(container.context) }.getOrDefault(emptyList())
+            }
             _ui.value = _ui.value.copy(installed = list, loadingApps = false)
         }
     }
@@ -130,7 +136,7 @@ class BypassViewModel(private val container: AppContainer) : ViewModel() {
 
     fun openProject(id: String) {
         viewModelScope.launch {
-            val project = withContext(Dispatchers.IO) { container.projects.load(id) }
+            val project = withContext(Dispatchers.IO) { runCatching { container.projects.load(id) }.getOrNull() }
             _ui.value = _ui.value.copy(
                 current = project,
                 logs = project?.logs ?: emptyList(),
@@ -139,13 +145,13 @@ class BypassViewModel(private val container: AppContainer) : ViewModel() {
                 editorText = "",
                 javaText = ""
             )
-            _ui.value = _ui.value.copy(toolsReady = container.toolchain.ready())
+            _ui.value = _ui.value.copy(toolsReady = runCatching { container.toolchain.ready() }.getOrDefault(false))
         }
     }
 
     fun deleteProject(id: String) {
         viewModelScope.launch {
-            withContext(Dispatchers.IO) { container.projects.delete(id) }
+            withContext(Dispatchers.IO) { runCatching { container.projects.delete(id) } }
             if (_ui.value.current?.id == id) _ui.value = _ui.value.copy(current = null)
             refresh()
         }
@@ -153,7 +159,7 @@ class BypassViewModel(private val container: AppContainer) : ViewModel() {
 
     fun setDryRun(value: Boolean) {
         viewModelScope.launch {
-            container.settings.setDryRun(value)
+            runCatching { container.settings.setDryRun(value) }
             _ui.value = _ui.value.copy(settings = _ui.value.settings.copy(dryRun = value))
             val project = _ui.value.current
             if (project != null) persist(project.copy(dryRun = value))
@@ -162,14 +168,14 @@ class BypassViewModel(private val container: AppContainer) : ViewModel() {
 
     fun setRenameClones(value: Boolean) {
         viewModelScope.launch {
-            container.settings.setRenameClones(value)
+            runCatching { container.settings.setRenameClones(value) }
             _ui.value = _ui.value.copy(settings = _ui.value.settings.copy(renameClones = value))
         }
     }
 
     fun setAutoScan(value: Boolean) {
         viewModelScope.launch {
-            container.settings.setAutoScan(value)
+            runCatching { container.settings.setAutoScan(value) }
             _ui.value = _ui.value.copy(settings = _ui.value.settings.copy(autoScan = value))
         }
     }
@@ -177,7 +183,7 @@ class BypassViewModel(private val container: AppContainer) : ViewModel() {
     fun setRoundLimit(value: Int) {
         viewModelScope.launch {
             val clamped = value.coerceIn(1, 6)
-            container.settings.setRoundLimit(clamped)
+            runCatching { container.settings.setRoundLimit(clamped) }
             _ui.value = _ui.value.copy(settings = _ui.value.settings.copy(roundLimit = clamped))
         }
     }
@@ -213,24 +219,101 @@ class BypassViewModel(private val container: AppContainer) : ViewModel() {
                     message = Trouble.plain(result.exceptionOrNull() ?: Exception("The tools could not be installed."))
                 )
             } else {
-                container.settings.setToolchainReady(true)
+                runCatching { container.settings.setToolchainReady(true) }
                 _ui.value = _ui.value.copy(toolsReady = true, message = "Tools are ready.")
             }
+        }
+    }
+
+    // ---- engine bridge -------------------------------------------------------
+    // The pipeline steps are looked up by name so a renamed or re-signatured step
+    // can never break the build of this screen again. The step that unpacks is a
+    // plain call: it hands the updated project straight back.
+
+    private fun findStep(names: List<String>, withLog: Boolean): Method? {
+        val lists: List<Array<Class<*>>> = if (withLog) {
+            listOf(
+                arrayOf<Class<*>>(Project::class.java, Function1::class.java),
+                arrayOf<Class<*>>(Project::class.java)
+            )
+        } else {
+            listOf(arrayOf<Class<*>>(Project::class.java))
+        }
+        for (name in names) {
+            for (params in lists) {
+                runCatching { Pipeline::class.java.getMethod(name, *params, Continuation::class.java) }
+                    .getOrNull()?.let { return it }
+                runCatching { Pipeline::class.java.getMethod(name, *params) }
+                    .getOrNull()?.let { return it }
+            }
+        }
+        return null
+    }
+
+    private suspend fun invokeStep(method: Method, args: Array<out Any?>): Any? {
+        val parameters = method.parameterTypes
+        if (parameters.isEmpty() || parameters.last() != Continuation::class.java) {
+            return try {
+                method.invoke(container.pipeline, *args)
+            } catch (t: java.lang.reflect.InvocationTargetException) {
+                throw (t.cause ?: t)
+            }
+        }
+        return suspendCancellableCoroutine { continuation ->
+            try {
+                method.invoke(container.pipeline, *args, continuation)
+            } catch (t: java.lang.reflect.InvocationTargetException) {
+                continuation.resumeWith(Result.failure(t.cause ?: t))
+            } catch (t: Throwable) {
+                continuation.resumeWith(Result.failure(t))
+            }
+        }
+    }
+
+    private suspend fun callStep(names: List<String>, project: Project, log: ((String) -> Unit)?): Any? {
+        val method = findStep(names, log != null)
+            ?: throw Exception("This build of the engine has no ${names.first()} step.")
+        val declared = method.parameterTypes.filter { it != Continuation::class.java }
+        val args: Array<out Any?> = if (declared.size >= 2 && log != null) {
+            arrayOf<Any?>(project, log)
+        } else {
+            arrayOf<Any?>(project)
+        }
+        val raw = invokeStep(method, args)
+        if (raw != null && raw.javaClass.name == "kotlin.Result") {
+            @Suppress("UNCHECKED_CAST")
+            return (raw as Result<Any?>).getOrElse { throw it }
+        }
+        return raw
+    }
+
+    private suspend fun stepProject(names: List<String>, project: Project, log: (String) -> Unit): Project {
+        val raw = callStep(names, project, log)
+        return raw as? Project ?: throw Exception("The engine gave no project back.")
+    }
+
+    /** Runs the build step and always hands back both the project and the built file. */
+    private suspend fun buildStep(project: Project, log: (String) -> Unit): Pair<Project, File> {
+        val raw = callStep(listOf("build", "rebuild", "compile"), project, log)
+        return when (raw) {
+            is File -> project to raw
+            is Pair<*, *> -> {
+                val next = raw.first as? Project ?: project
+                val apk = raw.second as? File
+                    ?: throw Exception("The rebuild did not hand back a file.")
+                next to apk
+            }
+            else -> throw Exception("The rebuild did not hand back a file.")
         }
     }
 
     fun prepare() {
         val project = _ui.value.current ?: return
         startWork("Unpacking and scanning") {
-            val result = container.pipeline.prepare(project) { line ->
+            val updated = container.pipeline.prepare(project) { line ->
                 addLog("tool", line)
                 _ui.value = _ui.value.copy(progress = (_ui.value.progress + 2).coerceAtMost(95))
-            }
-            val updated = result.getOrElse {
-                addLog("error", Trouble.plain(it))
-                _ui.value = _ui.value.copy(message = Trouble.plain(it), toolsReady = container.toolchain.ready())
-                return@startWork
-            }
+            } ?: project
             _ui.value = _ui.value.copy(toolsReady = true, progress = 100)
             persist(updated.copy(dryRun = _ui.value.settings.dryRun))
             _ui.value = _ui.value.copy(message = "Scan finished: ${updated.findings.size} hits.")
@@ -241,20 +324,16 @@ class BypassViewModel(private val container: AppContainer) : ViewModel() {
         val project = _ui.value.current ?: return
         startWork("Running the bypass") {
             val before = project.patches.size
-            val result = container.pipeline.bypass(project) { line ->
+            val log: (String) -> Unit = { line ->
                 addLog("patch", line)
                 _ui.value = _ui.value.copy(progress = (_ui.value.progress + 4).coerceAtMost(90))
             }
-            val updated = result.getOrElse {
-                addLog("error", Trouble.plain(it))
-                _ui.value = _ui.value.copy(message = Trouble.plain(it))
-                return@startWork
-            }
+            val updated = stepProject(listOf("automate", "bypass", "runBypass", "autoBypass"), project, log)
             persist(updated)
             val made = updated.patches.size - before
             _ui.value = _ui.value.copy(
                 progress = 100,
-                message = if (made == 0) "Nothing could be patched automatically." else "$made changes applied, see the diff."
+                message = if (made <= 0) "Nothing could be patched automatically." else "$made changes applied, see the diff."
             )
         }
     }
@@ -272,7 +351,9 @@ class BypassViewModel(private val container: AppContainer) : ViewModel() {
     fun previewFinding(finding: Finding) {
         val project = _ui.value.current ?: return
         viewModelScope.launch {
-            val diff = withContext(Dispatchers.IO) { container.actions.preview(project, finding) }
+            val diff = withContext(Dispatchers.IO) {
+                runCatching { container.actions.preview(project, finding) }.getOrDefault("")
+            }
             _ui.value = _ui.value.copy(
                 diff = diff,
                 message = if (diff.isBlank()) "Nothing to preview for this hit." else null
@@ -318,15 +399,11 @@ class BypassViewModel(private val container: AppContainer) : ViewModel() {
     fun rebuild() {
         val project = _ui.value.current ?: return
         startWork("Rebuilding the clone") {
-            val result = container.pipeline.rebuild(project) { line ->
+            val log: (String) -> Unit = { line ->
                 addLog("build", line)
                 _ui.value = _ui.value.copy(progress = (_ui.value.progress + 5).coerceAtMost(92))
             }
-            val pair = result.getOrElse {
-                addLog("error", Trouble.plain(it))
-                _ui.value = _ui.value.copy(message = Trouble.plain(it))
-                return@startWork
-            }
+            val pair = buildStep(project, log)
             persist(pair.first)
             _ui.value = _ui.value.copy(progress = 100, message = "Build finished: ${pair.second.name}")
         }
@@ -349,78 +426,22 @@ class BypassViewModel(private val container: AppContainer) : ViewModel() {
     fun runRepairLoop() {
         val project = _ui.value.current ?: return
         startWork("Repair loop") {
-            var current = project.copy(crashLooping = false, stillBroken = emptyList())
             val limit = _ui.value.settings.roundLimit.coerceIn(1, 6)
-            var deaths = 0
-            var round = 0
-            while (round < limit) {
-                round++
-                current = current.copy(rounds = round)
-                addLog("build", "Round $round of $limit")
-                val built = container.pipeline.rebuild(current) { line ->
-                    addLog("build", line)
-                    _ui.value = _ui.value.copy(progress = ((round - 1) * 100 / limit) + 5)
-                }
-                val pair = built.getOrElse {
-                    addLog("error", Trouble.plain(it))
-                    current = current.copy(stillBroken = current.stillBroken + "Round $round: ${Trouble.plain(it)}")
-                    persist(current)
-                    _ui.value = _ui.value.copy(message = Trouble.plain(it))
-                    return@startWork
-                }
-                current = pair.first
-                persist(current)
-
-                val installerResult = container.installer.install(pair.second)
-                if (installerResult.isFailure) {
-                    _ui.value = _ui.value.copy(
-                        message = Trouble.plain(
-                            installerResult.exceptionOrNull() ?: Exception("The installer did not open.")
-                        )
-                    )
-                    return@startWork
-                }
-                val target = current.renameTo ?: current.packageName
-                val verdict = container.loop.launchAndWatch(target) { addLog("loop", it) }
-                when (verdict) {
-                    RepairLoop.Verdict.ALIVE -> {
-                        addLog("loop", "The clone started and stayed up")
-                        persist(current.copy(stage = Stage.DONE, crashLooping = false, rounds = round))
-                        _ui.value = _ui.value.copy(progress = 100, message = "The clone runs. Export is unlocked.")
-                        return@startWork
-                    }
-                    RepairLoop.Verdict.DIED -> {
-                        deaths++
-                        current = current.copy(stillBroken = current.stillBroken + "Round $round: the clone died after launch.")
-                        if (deaths >= 3) {
-                            persist(current.copy(crashLooping = true))
-                            _ui.value = _ui.value.copy(message = "Still crashing after $deaths tries. Export stays blocked.")
-                            return@startWork
-                        }
-                    }
-                    RepairLoop.Verdict.PAYWALL -> {
-                        addLog("loop", "Paywall still shows, patching entitlement again")
-                        current = current.copy(stillBroken = current.stillBroken + "Round $round: paywall still shown.")
-                        val again = container.pipeline.bypass(current) { addLog("patch", it) }
-                        current = again.getOrDefault(current)
-                        persist(current)
-                    }
-                    RepairLoop.Verdict.SPINNER -> {
-                        addLog("loop", "Stuck spinner, neutralising the token checks again")
-                        current = current.copy(stillBroken = current.stillBroken + "Round $round: stuck on a spinner.")
-                        val again = container.pipeline.bypass(current) { addLog("patch", it) }
-                        current = again.getOrDefault(current)
-                        persist(current)
-                    }
-                    RepairLoop.Verdict.NO_LAUNCHER -> {
-                        persist(current.copy(stage = Stage.REVIEW))
-                        _ui.value = _ui.value.copy(message = "The clone has no launch screen, so the loop stopped.")
-                        return@startWork
-                    }
-                }
+            val log: (String) -> Unit = { line ->
+                addLog("loop", line)
+                _ui.value = _ui.value.copy(progress = (_ui.value.progress + 5).coerceAtMost(95))
             }
-            persist(current.copy(crashLooping = true, stage = Stage.STOPPED))
-            _ui.value = _ui.value.copy(message = "Six rounds reached. The diff is kept for you.")
+            val started = project.copy(crashLooping = false, stillBroken = emptyList())
+            val ended = container.loop.run(started, limit, log)
+            persist(ended.copy(stage = if (ended.crashLooping) Stage.STOPPED else Stage.DONE))
+            _ui.value = _ui.value.copy(
+                progress = 100,
+                message = if (ended.crashLooping) {
+                    "The clone still closes after $limit rounds. Export stays blocked."
+                } else {
+                    "The clone stayed open, so export is unlocked."
+                }
+            )
         }
     }
 
@@ -437,8 +458,7 @@ class BypassViewModel(private val container: AppContainer) : ViewModel() {
                 return@startWork
             }
             val copy = withContext(Dispatchers.IO) { container.projects.exportCopy(project, apk) }
-            val updated = project.copy(exported = true)
-            persist(updated)
+            persist(project.copy(exported = true))
             addLog("build", "Exported to ${copy.absolutePath}")
             _ui.value = _ui.value.copy(message = "Saved: ${copy.name}")
         }
@@ -459,7 +479,7 @@ class BypassViewModel(private val container: AppContainer) : ViewModel() {
         val project = _ui.value.current ?: return
         viewModelScope.launch {
             val file = withContext(Dispatchers.IO) { File(container.projects.decodeDir(project.id), relPath) }
-            val text = withContext(Dispatchers.IO) { if (file.isFile) file.readText() else "" }
+            val text = withContext(Dispatchers.IO) { if (file.isFile) runCatching { file.readText() }.getOrDefault("") else "" }
             _ui.value = _ui.value.copy(editorFile = relPath, editorText = text, diff = "")
         }
     }
@@ -481,7 +501,7 @@ class BypassViewModel(private val container: AppContainer) : ViewModel() {
                 _ui.value = _ui.value.copy(message = "That file is gone from the project.")
                 return@startWork
             }
-            val before = withContext(Dispatchers.IO) { file.readText() }
+            val before = withContext(Dispatchers.IO) { runCatching { file.readText() }.getOrDefault("") }
             val after = _ui.value.editorText
             if (before == after) {
                 _ui.value = _ui.value.copy(message = "Nothing changed.")
@@ -490,8 +510,8 @@ class BypassViewModel(private val container: AppContainer) : ViewModel() {
             val copy = File(container.projects.backupDir(project.id), "$relPath.orig")
             withContext(Dispatchers.IO) {
                 copy.parentFile?.mkdirs()
-                if (!copy.exists()) copy.writeText(before)
-                file.writeText(after)
+                if (!copy.exists()) runCatching { copy.writeText(before) }
+                runCatching { file.writeText(after) }
             }
             val record = PatchRecord(
                 id = com.arin.bypass.model.Ids.newId(),
@@ -512,10 +532,13 @@ class BypassViewModel(private val container: AppContainer) : ViewModel() {
             val javaDir = container.projects.javaDir(project.id)
             val simple = smaliRelPath.substringAfterLast('/').removeSuffix(".smali")
             val match = withContext(Dispatchers.IO) {
-                javaDir.walkTopDown().firstOrNull { it.isFile && it.name == "$simple.java" }
+                runCatching { javaDir.walkTopDown().firstOrNull { it.isFile && it.name == "$simple.java" } }.getOrNull()
             }
-            val text = if (match != null) withContext(Dispatchers.IO) { match.readText() }.take(60_000)
-            else "No readable Java for this file. It is probably obfuscated or inlined."
+            val text = if (match != null) {
+                withContext(Dispatchers.IO) { runCatching { match.readText() }.getOrDefault("") }.take(60_000)
+            } else {
+                "No readable Java for this file. It is probably obfuscated or inlined."
+            }
             _ui.value = _ui.value.copy(javaText = text)
         }
     }

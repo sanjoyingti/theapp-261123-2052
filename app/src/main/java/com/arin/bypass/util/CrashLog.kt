@@ -118,8 +118,9 @@ object CrashLog {
             // file first, screen second, hand back to the system last
             runCatching { write("uncaught on ${thread.name}", error) }
             runCatching { openScreen() }
-            if (previous != null && previous !== this) {
-                runCatching { previous.uncaughtException(thread, error) }
+            val fallback = previous
+            if (fallback != null && fallback !== this) {
+                runCatching { fallback.uncaughtException(thread, error) }
             }
         }
 
