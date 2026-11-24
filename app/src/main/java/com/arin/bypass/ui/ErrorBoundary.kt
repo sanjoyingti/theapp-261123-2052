@@ -17,38 +17,50 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.layout.SubcomposeLayout
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import com.arin.bypass.util.CrashLog
+import com.arin.bypass.util.CrashTail
 import com.arin.bypass.util.Trouble
 
 /**
- * Draws its content, and if that content throws while being drawn, shows a plain card
- * with the reason and a Retry button. The rest of the app keeps working.
+ * Draws its content through a sub-layout, which is the one place a drawing failure can
+ * actually be caught: a plain try block inside a composable body is refused by the
+ * Compose compiler, but a measure lambda is an ordinary function. If drawing throws, a
+ * card with the reason and a Retry button replaces the content and the rest of Arin keeps
+ * working. Every failure is written to the crash file before the card appears.
  */
 @Composable
 fun Boundary(content: @Composable () -> Unit) {
     var attempt by remember { mutableIntStateOf(0) }
-    var failure by remember { mutableStateOf<String?>(null) }
+    var failure by remember { mutableStateOf<Throwable?>(null) }
     var saved by remember { mutableStateOf<String?>(null) }
     val context = LocalContext.current
+    val current = failure
 
-    val message = failure
-    if (message == null) {
-        try {
-            key(attempt) { content() }
-        } catch (t: Throwable) {
-            CrashLog.write("screen draw", t)
-            failure = Trouble.plain(t)
-            saved = CrashLog.recent(context)
+    if (current == null) {
+        SubcomposeLayout(Modifier.fillMaxSize()) { constraints ->
+            val placeables = try {
+                subcompose(attempt) { content() }.map { it.measure(constraints) }
+            } catch (t: Throwable) {
+                CrashLog.write("screen draw", t)
+                failure = t
+                saved = CrashTail.read(context)
+                emptyList()
+            }
+            val width = if (constraints.hasBoundedWidth) constraints.maxWidth else 0
+            val height = if (constraints.hasBoundedHeight) constraints.maxHeight else 0
+            layout(width, height) {
+                placeables.forEach { it.placeRelative(0, 0) }
+            }
         }
     } else {
         Box(
@@ -69,7 +81,11 @@ fun Boundary(content: @Composable () -> Unit) {
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     Text("This screen could not be drawn", style = MaterialTheme.typography.titleMedium)
-                    Text(message, style = MaterialTheme.typography.bodyMedium)
+                    Text(Trouble.plain(current), style = MaterialTheme.typography.bodyMedium)
+                    Text(
+                        "The rest of Arin still works. Press Retry to draw the screen again.",
+                        style = MaterialTheme.typography.bodySmall
+                    )
                     val extra = saved
                     if (extra != null) {
                         Text("Last saved crash", style = MaterialTheme.typography.labelSmall)
@@ -86,28 +102,6 @@ fun Boundary(content: @Composable () -> Unit) {
                         }) { Text("Retry") }
                     }
                 }
-            }
-        }
-    }
-}
-
-@Composable
-fun MissingAppCard() {
-    Box(
-        Modifier
-            .fillMaxSize()
-            .background(MaterialTheme.colorScheme.background)
-            .padding(16.dp),
-        contentAlignment = Alignment.Center
-    ) {
-        Card(Modifier.fillMaxWidth()) {
-            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("The app did not start properly", style = MaterialTheme.typography.titleMedium)
-                Text("Close the app fully and open it again. If it keeps happening, the crash log below names the cause.")
-                Text(
-                    CrashLog.recent(LocalContext.current) ?: "No crash was saved yet.",
-                    style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace)
-                )
             }
         }
     }

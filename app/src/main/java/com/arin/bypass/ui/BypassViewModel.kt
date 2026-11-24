@@ -1,5 +1,6 @@
 package com.arin.bypass.ui
 
+import android.content.Context
 import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
@@ -82,7 +83,7 @@ class BypassViewModel(private val container: AppContainer) : ViewModel() {
             val ready = withContext(Dispatchers.IO) {
                 runCatching { container.toolchain.ready() }.getOrDefault(false)
             }
-            val watcher = runCatching { container.watcher.isEnabled(container.context) }.getOrDefault(false)
+            val watcher = watcherEnabled()
             val port = withContext(Dispatchers.IO) {
                 runCatching { container.settings.port(_state.value.port) }.getOrDefault(_state.value.port)
             }
@@ -93,7 +94,7 @@ class BypassViewModel(private val container: AppContainer) : ViewModel() {
                     settings = settings,
                     toolsReady = ready,
                     watcherOn = watcher,
-                    mockRunning = container.mock.running,
+                    mockRunning = runCatching { container.mock.running }.getOrDefault(false),
                     port = port
                 )
             }
@@ -253,9 +254,9 @@ class BypassViewModel(private val container: AppContainer) : ViewModel() {
             try {
                 method.invoke(container.pipeline, *args, continuation)
             } catch (t: java.lang.reflect.InvocationTargetException) {
-                continuation.resumeWithException(t.cause ?: t)
+                continuation.resumeWith(Result.failure(t.cause ?: t))
             } catch (t: Throwable) {
-                continuation.resumeWithException(t)
+                continuation.resumeWith(Result.failure(t))
             }
         }
     }
@@ -274,6 +275,40 @@ class BypassViewModel(private val container: AppContainer) : ViewModel() {
 
     private suspend fun stepProject(names: List<String>, vararg args: Any?): Project =
         callStep(names, *args) as? Project ?: throw Exception("The engine gave no project back.")
+
+    // ---- helper calls are resolved by name as well, because the service listener
+    // ---- and the screen reader are allowed to gain a target-package argument.
+
+    private fun callHelper(target: Any?, name: String): Any? {
+        if (target == null) return null
+        val methods = runCatching { target.javaClass.methods.toList() }.getOrDefault(emptyList())
+        val context = container.context
+        val packageName = runCatching { _state.value.open?.packageName }.getOrNull() ?: context.packageName
+        val two = methods.firstOrNull {
+            it.name == name && it.parameterTypes.size == 2 && it.parameterTypes[0] == Context::class.java
+        }
+        if (two != null) {
+            return runCatching { two.invoke(target, context, packageName) }.getOrNull()
+        }
+        val one = methods.firstOrNull {
+            it.name == name && it.parameterTypes.size == 1 && it.parameterTypes[0] == Context::class.java
+        }
+        if (one != null) {
+            return runCatching { one.invoke(target, context) }.getOrNull()
+        }
+        return null
+    }
+
+    private fun watcherEnabled(): Boolean {
+        val listener = runCatching { container.watcher }.getOrNull() ?: return false
+        return callHelper(listener, "isEnabled") as? Boolean ?: false
+    }
+
+    private fun probeReading(): String {
+        val reader = runCatching { container.probe }.getOrNull()
+        val text = callHelper(reader, "describe") as? String
+        return text?.takeIf { it.isNotBlank() } ?: "No reading."
+    }
 
     /**
      * Unpacking and scanning happen in one engine step, so this button and the scan
@@ -455,21 +490,23 @@ class BypassViewModel(private val container: AppContainer) : ViewModel() {
 
     fun refreshWatcher() {
         viewModelScope.launch {
-            val on = withContext(Dispatchers.IO) { runCatching { container.watcher.isEnabled(container.context) }.getOrDefault(false) }
+            val on = withContext(Dispatchers.IO) { watcherEnabled() }
             _state.update { it.copy(watcherOn = on) }
         }
     }
 
     fun openWatcherSettings() {
-        if (!container.watcher.open(container.context)) {
+        val listener = runCatching { container.watcher }.getOrNull()
+        val opened = callHelper(listener, "open") as? Boolean ?: false
+        if (!opened) {
             _state.update { it.copy(error = "The accessibility settings page could not be opened.") }
         }
     }
 
     fun readProbe() {
         viewModelScope.launch {
-            val text = withContext(Dispatchers.IO) { runCatching { container.probe.describe(container.context) }.getOrDefault("No reading.") }
-            val on = runCatching { container.watcher.isEnabled(container.context) }.getOrDefault(false)
+            val text = withContext(Dispatchers.IO) { probeReading() }
+            val on = withContext(Dispatchers.IO) { watcherEnabled() }
             _state.update { it.copy(probeText = text, watcherOn = on) }
         }
     }
@@ -496,7 +533,7 @@ class BypassViewModel(private val container: AppContainer) : ViewModel() {
     fun readMockLog() {
         viewModelScope.launch {
             val lines = withContext(Dispatchers.IO) { runCatching { container.mock.log() }.getOrDefault(emptyList()) }
-            _state.update { it.copy(mockLog = lines, mockRunning = container.mock.running) }
+            _state.update { it.copy(mockLog = lines, mockRunning = runCatching { container.mock.running }.getOrDefault(false)) }
         }
     }
 
