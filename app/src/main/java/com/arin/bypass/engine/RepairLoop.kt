@@ -1,67 +1,77 @@
 package com.arin.bypass.engine
 
-import android.app.ActivityManager
 import android.content.Context
-import android.content.Intent
-import com.arin.bypass.service.BypassAccessibilityService
-import kotlinx.coroutines.Dispatchers
+import com.arin.bypass.model.LogLine
+import com.arin.bypass.model.Project
+import com.arin.bypass.model.Stage
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.withContext
 
-/** Launches the rebuilt app and reports how it behaved. */
-class RepairLoop(private val context: Context, private val installer: Installer) {
+/**
+ * Builds, installs and watches. If the app dies it goes another round until the
+ * limit is used up, then it stops with the reason written into the project.
+ */
+class RepairLoop(
+    private val context: Context,
+    private val installer: Installer,
+    private val rounds: RoundMonitor,
+    private val pipeline: Pipeline
+) {
 
-    enum class Verdict { ALIVE, DIED, PAYWALL, SPINNER, NO_LAUNCHER }
+    private fun note(project: Project, message: String): Project =
+        project.copy(
+            logs = (project.logs + LogLine(System.currentTimeMillis(), "w", message)).takeLast(400)
+        )
 
-    suspend fun launchAndWatch(appPackage: String, log: (String) -> Unit): Verdict = withContext(Dispatchers.IO) {
-        val launch = runCatching { context.packageManager.getLaunchIntentForPackage(appPackage) }.getOrNull()
-        if (launch == null) {
-            log("No launch screen found for $appPackage")
-            return@withContext Verdict.NO_LAUNCHER
-        }
-        BypassAccessibilityService.forget()
-        launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        val started = runCatching { context.startActivity(launch) }.isSuccess
-        if (!started) {
-            log("The clone could not be started")
-            return@withContext Verdict.DIED
-        }
-        log("Launched $appPackage, watching for 20 seconds")
-
-        val manager = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
-        var seen = false
-        var lastSeen = System.currentTimeMillis()
-
-        repeat(20) { tick ->
-            delay(1000)
-            val running = isRunning(manager, appPackage)
-            if (running) {
-                seen = true
-                lastSeen = System.currentTimeMillis()
+    suspend fun run(project: Project, limit: Int, onLog: (String) -> Unit): Project {
+        var current = project
+        val cap = limit.coerceIn(1, 6)
+        while (rounds.used(current.id) < cap && !current.stopped) {
+            val round = rounds.bump(current.id)
+            onLog("Round $round of $cap")
+            current = current.copy(rounds = round)
+            if (current.findings.isEmpty()) current = pipeline.rescan(current, onLog)
+            current = pipeline.prepare(current, onLog)
+            if (current.stage == Stage.STOPPED) {
+                onLog("Preparation stopped, trying the build anyway")
             }
-            if (BypassAccessibilityService.looksLikePaywall() && tick >= 3) {
-                log("Screen still shows a paywall")
-                return@withContext Verdict.PAYWALL
+            val built = pipeline.build(current, onLog)
+            current = built.first
+            val result = built.second
+            if (result is BuildResult.Failure) {
+                onLog(result.message)
+                return note(current.copy(stage = Stage.STOPPED), result.message)
             }
-            if (seen && !running && System.currentTimeMillis() - lastSeen > 2500) {
-                log("The clone died after launch")
-                return@withContext Verdict.DIED
+            val apk = (result as BuildResult.Success).apk
+            current = note(current, "Built ${apk.name}")
+
+            if (current.dryRun) {
+                onLog("Dry run is on, nothing is installed")
+                return current.copy(stage = Stage.DONE)
             }
+
+            val permission = installer.install(apk)
+            if (permission.isFailure) {
+                val reason = permission.exceptionOrNull()?.message ?: "The installer would not open."
+                onLog(reason)
+                return note(current.copy(stage = Stage.STOPPED), reason)
+            }
+
+            delay(3000)
+            val alive = ScreenProbe.alive(context, current.packageName)
+            if (alive) {
+                onLog("The app is running after the round")
+                return current.copy(stage = Stage.DONE)
+            }
+            onLog("The app did not stay open")
+            val looping = rounds.markDeath(current.id)
+            ScreenProbe.note("The rebuilt app closed right after opening.")
+            current = note(current.copy(crashLooping = looping), "The app closed right after opening")
+            if (loop_count(current) >= cap) break
         }
-        if (!seen) {
-            log("The clone never became visible")
-            return@withContext Verdict.DIED
-        }
-        if (BypassAccessibilityService.looksStuck()) {
-            log("The clone looks stuck on a spinner")
-            return@withContext Verdict.SPINNER
-        }
-        Verdict.ALIVE
+        val message = "Stopped after ${rounds.used(current.id)} rounds. ${ScreenProbe.lastError()}"
+        onLog(message)
+        return note(current.copy(stage = Stage.STOPPED), message)
     }
 
-    private fun isRunning(manager: ActivityManager?, appPackage: String): Boolean {
-        if (manager == null) return true
-        val processes = runCatching { manager.runningAppProcesses }.getOrNull() ?: return true
-        return processes.any { it.processName == appPackage || it.processName.startsWith("$appPackage:") }
-    }
+    private fun loop_count(project: Project): Int = project.rounds
 }

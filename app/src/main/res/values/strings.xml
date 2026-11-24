@@ -1,6 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">APK Bypass</string>
-    <string name="accessibility_label">APK Bypass watcher</string>
-    <string name="accessibility_description">Watches a launched clone so the repair loop can notice a crash, a paywall bounce or a stuck spinner.</string>
+    <string name="app_name">Arin</string>
+    <string name="bypass_name">APK Bypass</string>
+    <string name="watcher_label">Arin screen watcher</string>
+    <string name="watcher_description">Lets Arin see whether a rebuilt app opens or shows a crash, so the repair rounds can work.</string>
+    <string name="sync_channel">Background sync</string>
+    <string name="sync_title">Arin is checking projects</string>
 </resources>

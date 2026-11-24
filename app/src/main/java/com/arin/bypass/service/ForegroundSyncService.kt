@@ -1,55 +1,78 @@
 package com.arin.bypass.service
 
-import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
-import android.content.Context
 import android.content.Intent
+import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import com.arin.bypass.R
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 
-/** Only exists so long unpack/rebuild work survives the app going to the background. */
+/** Holds the process up while a build runs and shows one low-priority notice. */
 class ForegroundSyncService : Service() {
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
-        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        val channel = NotificationChannel(CHANNEL, "Bypass work", NotificationManager.IMPORTANCE_LOW)
-        channel.description = "Keeps unpacking and rebuilding running while you are away."
+        try {
+            createChannel()
+            val notification = NotificationCompat.Builder(this, CHANNEL)
+                .setSmallIcon(R.drawable.ic_launcher)
+                .setContentTitle(getString(R.string.app_name))
+                .setContentText(getString(R.string.notice_working))
+                .setOngoing(true)
+                .setPriority(NotificationCompat.PRIORITY_LOW)
+                .build()
+            startForeground(ID, notification)
+        } catch (t: Throwable) {
+            stopSelf()
+        }
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        scope.launch {
+            try {
+                cacheDir.mkdirs()
+            } catch (t: Throwable) {
+                // a missing cache folder must not stop the service
+            }
+            stopSelf(startId)
+        }
+        return START_NOT_STICKY
+    }
+
+    override fun onDestroy() {
+        try {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        } catch (t: Throwable) {
+            // already gone
+        }
+        super.onDestroy()
+    }
+
+    private fun createChannel() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        val manager = getSystemService(NotificationManager::class.java) ?: return
+        if (manager.getNotificationChannel(CHANNEL) != null) return
+        val channel = NotificationChannel(
+            CHANNEL,
+            getString(R.string.notice_channel),
+            NotificationManager.IMPORTANCE_LOW
+        )
         channel.setShowBadge(false)
         manager.createNotificationChannel(channel)
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        startForeground(NOTIFICATION_ID, build())
-        return START_STICKY
-    }
-
-    private fun build(): Notification =
-        NotificationCompat.Builder(this, CHANNEL)
-            .setContentTitle("APK Bypass")
-            .setContentText("Working on your project in the background")
-            .setSmallIcon(R.drawable.ic_launcher)
-            .setOngoing(true)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
-            .build()
-
     companion object {
         private const val CHANNEL = "bypass_work"
-        private const val NOTIFICATION_ID = 4711
-
-        fun start(context: Context) {
-            runCatching {
-                context.startForegroundService(Intent(context, ForegroundSyncService::class.java))
-            }
-        }
-
-        fun stop(context: Context) {
-            runCatching { context.stopService(Intent(context, ForegroundSyncService::class.java)) }
-        }
+        private const val ID = 4101
     }
 }

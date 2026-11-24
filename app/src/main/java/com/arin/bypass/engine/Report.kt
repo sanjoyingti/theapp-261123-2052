@@ -3,58 +3,58 @@ package com.arin.bypass.engine
 import com.arin.bypass.model.Project
 import com.arin.bypass.util.Format
 
-/** Builds the plain-language markdown report for one project. */
+/** Builds the markdown report for one project, in plain words. */
 class Report {
 
-    fun markdown(project: Project): String {
-        val out = StringBuilder()
-        out.append("# Bypass report — ").append(project.name).append("\n\n")
-        out.append("- Package: `").append(project.packageName).append("`\n")
-        out.append("- Version: ").append(project.versionName.ifBlank { "unknown" }).append('\n')
-        out.append("- Created: ").append(Format.day(project.createdAt)).append('\n')
-        out.append("- Stage: ").append(project.stage.name).append('\n')
-        out.append("- Dry run: ").append(if (project.dryRun) "yes" else "no").append('\n')
-        out.append("- Rounds used: ").append(project.rounds).append('\n')
-        out.append("- Original fingerprint: ").append(Format.sha(project.originalSha256)).append("\n\n")
+    fun markdown(project: Project): String = buildString {
+        append("# ").append(project.name).append("\n\n")
+        append("- Package: `").append(project.packageName).append("`\n")
+        append("- Version: ").append(project.versionName.ifBlank { "unknown" }).append("\n")
+        append("- Created: ").append(Format.day(project.createdAt)).append("\n")
+        append("- Stage: ").append(project.stage.name).append("\n")
+        append("- Original hash: `").append(Format.sha(project.originalSha256)).append("`\n")
+        append("- Working hash: `").append(Format.sha(project.workingSha256)).append("`\n\n")
 
-        out.append("## Found (").append(project.findings.size).append(")\n\n")
-        if (project.findings.isEmpty()) {
-            out.append("- Nothing detected.\n")
+        append("## Applied changes\n\n")
+        val live = project.patches.filter { !it.reverted }
+        if (live.isEmpty()) {
+            append("No change was applied.\n\n")
         } else {
-            for (finding in project.findings.sortedByDescending { it.confidence }) {
-                out.append("- **").append(finding.title).append("** (")
-                    .append(finding.category.name).append(", ")
-                    .append(finding.confidence).append("%) at `")
-                    .append(finding.file).append(':').append(finding.line).append('`')
-                if (finding.patched) out.append(" — patched")
-                if (finding.dismissed) out.append(" — dismissed")
-                out.append('\n')
+            live.forEach { append("- ").append(it.title).append(" in `").append(it.file).append("`\n") }
+            append('\n')
+        }
+
+        val reverted = project.patches.count { it.reverted }
+        if (reverted > 0) append("Reverted changes: ").append(reverted).append("\n\n")
+
+        append("## Detected hits\n\n")
+        val findings = project.findings.filter { !it.dismissed }
+        if (findings.isEmpty()) {
+            append("Nothing was detected.\n\n")
+        } else {
+            findings.sortedByDescending { it.confidence }.take(120).forEach {
+                append("- [").append(it.category.name).append("] ").append(it.title)
+                append(" (").append(it.confidence).append("%) at `").append(it.file)
+                if (it.line > 0) append(':').append(it.line)
+                append("`\n")
             }
+            append('\n')
         }
 
-        out.append("\n## Changed (").append(project.patches.count { !it.reverted }).append(")\n\n")
-        if (project.patches.isEmpty()) {
-            out.append("- Nothing changed yet.\n")
-        } else {
-            for (patch in project.patches) {
-                out.append("- ")
-                if (patch.reverted) out.append("~~reverted~~ ") else out.append("applied ")
-                out.append(patch.title).append(" in `").append(patch.file).append("`\n")
-            }
+        if (project.entitlementSymbols.isNotEmpty()) {
+            append("## Entitlement producers\n\n")
+            project.entitlementSymbols.forEach { append("- `").append(it).append("`\n") }
+            append('\n')
         }
 
-        out.append("\n## Still broken\n\n")
-        if (project.stillBroken.isEmpty()) {
-            out.append("- Nothing known right now.\n")
-        } else {
-            for (item in project.stillBroken) out.append("- ").append(item).append('\n')
+        if (project.stillBroken.isNotEmpty()) {
+            append("## Still open\n\n")
+            project.stillBroken.forEach { append("- ").append(it).append("\n") }
+            append('\n')
         }
 
-        out.append("\n## Log tail\n\n```\n")
-        for (line in project.logs.takeLast(60)) {
-            out.append(Format.time(line.time)).append(' ').append(line.level).append(' ').append(line.message).append('\n')
-        }
-        out.append("```\n")
-        return out.toString()
+        append("## Notes\n\n")
+        append("The untouched original is kept at `original/").append(project.baseApkName)
+        append("` and every change can be reverted on its own.\n")
     }
 }
