@@ -1,7 +1,8 @@
 package com.arin.bypass.util
 
 import android.content.Context
-import android.os.Build
+import android.content.Intent
+import com.arin.bypass.CrashActivity
 import java.io.File
 import java.io.PrintWriter
 import java.io.StringWriter
@@ -10,88 +11,122 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * Writes a crash to disk *before* the crash screen is shown, so the cause is still
- * there next time the app opens. Every call is guarded: logging may never throw.
+ * Every failure is written to a file *before* the crash screen is opened, so the
+ * cause is still on disk after the process died. Nothing in here is allowed to throw.
  */
 object CrashLog {
 
     private const val FOLDER = "crashes"
-    private const val KEEP = 12
+    private const val LAST = "last_crash.txt"
+    private const val KEEP = 20
 
     @Volatile
-    private var folder: File? = null
-
-    @Volatile
-    private var installed = false
+    private var app: Context? = null
 
     fun install(context: Context) {
-        if (folder == null) folder = File(context.filesDir, FOLDER).apply { mkdirs() }
-        if (installed) return
-        installed = true
+        val application = context.applicationContext
+        app = application
+        runCatching { folder(application).mkdirs() }
         val previous = Thread.getDefaultUncaughtExceptionHandler()
-        Thread.setDefaultUncaughtExceptionHandler { thread, error ->
-            write("uncaught on ${thread.name}", error)
-            try {
-                previous?.uncaughtException(thread, error)
-            } catch (t: Throwable) {
-                CrashLog.write("previous handler", t)
-            }
-        }
+        if (previous is Catcher) return
+        runCatching { Thread.setDefaultUncaughtExceptionHandler(Catcher(application, previous)) }
     }
 
-    /** Writes the full stack trace first, then trims old files. Never throws. */
-    fun write(stage: String, error: Throwable) {
-        val text = buildString {
-            append(stamp())
-            append("stage: ").append(stage).append('\n')
-            append("device: ").append(Build.MANUFACTURER).append(' ').append(Build.MODEL)
-            append(" / Android ").append(Build.VERSION.SDK_INT).append('\n')
-            val writer = StringWriter()
-            error.printStackTrace(PrintWriter(writer))
-            append(writer.toString())
-            append("\n\n")
-        }
-        persist(text)
+    fun folder(context: Context): File = File(context.filesDir, FOLDER)
+
+    fun path(context: Context): File = File(folder(context), LAST)
+
+    fun write(where: String, error: Throwable?) {
+        stash(report(where, error, null))
     }
 
-    fun write(stage: String, message: String) {
-        persist(
-            buildString {
-                append(stamp())
-                append("stage: ").append(stage).append('\n')
-                append(message).append("\n\n")
-            }
-        )
+    fun write(where: String, message: String?) {
+        stash(report(where, null, message))
     }
 
-    private fun persist(text: String) {
+    fun write(where: String) {
+        stash(report(where, null, null))
+    }
+
+    fun log(where: String) = write(where)
+
+    fun log(where: String, error: Throwable?) = write(where, error)
+
+    fun report(error: Throwable?): String = report("uncaught", error, null)
+
+    fun hasCrash(context: Context): Boolean = lastCrash(context) != null
+
+    /** Newest saved trace, or null when nothing was recorded. */
+    fun lastCrash(context: Context): String? {
+        val direct = File(folder(context), LAST)
+        val text = runCatching { if (direct.exists()) direct.readText() else "" }.getOrDefault("")
+        if (text.isNotBlank()) return text
+        val newest = folder(context).listFiles()
+            ?.filter { it.isFile && it.name.startsWith("crash-") }
+            ?.maxByOrNull { it.lastModified() }
+        val older = newest?.let { file -> runCatching { file.readText() }.getOrNull() }
+        return older?.takeIf { it.isNotBlank() }
+    }
+
+    fun clear(context: Context) {
+        runCatching { folder(context).listFiles()?.forEach { it.delete() } }
+    }
+
+    private fun stash(text: String) {
+        val context = app ?: return
         runCatching {
-            val dir = folder ?: return@runCatching
-            val target = File(dir, "crash.log")
-            target.appendText(text)
+            val dir = folder(context).apply { mkdirs() }
+            val stamp = SimpleDateFormat("yyyyMMdd-HHmmss-SSS", Locale.US).format(Date())
+            File(dir, "crash-$stamp.txt").writeText(text)
+            File(dir, LAST).writeText(text)
             trim(dir)
         }
     }
 
     private fun trim(dir: File) {
-        val files = dir.listFiles()?.sortedByDescending { it.lastModified() } ?: return
-        files.drop(KEEP).forEach { runCatching { it.delete() } }
+        val old = dir.listFiles()
+            ?.filter { it.isFile && it.name.startsWith("crash-") }
+            ?.sortedByDescending { it.lastModified() }
+            ?.drop(KEEP)
+            ?: return
+        old.forEach { runCatching { it.delete() } }
     }
 
-    fun directory(context: Context): File = folder ?: File(context.filesDir, FOLDER).apply { mkdirs() }
-
-    fun latest(context: Context): String = runCatching {
-        File(directory(context), "crash.log").takeIf { it.isFile }?.readText().orEmpty()
-    }.getOrDefault("")
-
-    fun files(context: Context): List<File> = runCatching {
-        directory(context).listFiles()?.sortedByDescending { it.lastModified() } ?: emptyList()
-    }.getOrDefault(emptyList())
-
-    fun clear(context: Context) {
-        runCatching { files(context).forEach { it.delete() } }
+    private fun report(where: String, error: Throwable?, message: String?): String {
+        val builder = StringBuilder()
+        builder.append("When: ")
+            .append(SimpleDateFormat("d MMM yyyy HH:mm:ss", Locale.US).format(Date()))
+            .append('\n')
+        builder.append("Where: ").append(where).append('\n')
+        builder.append("Thread: ").append(Thread.currentThread().name).append('\n')
+        if (!message.isNullOrBlank()) builder.append("Message: ").append(message).append('\n')
+        if (error != null) {
+            val writer = StringWriter()
+            runCatching { error.printStackTrace(PrintWriter(writer)) }
+            builder.append('\n').append(writer.toString())
+        }
+        builder.append('\n')
+        return builder.toString()
     }
 
-    private fun stamp(): String =
-        "----- " + SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date()) + "\n"
+    private class Catcher(
+        private val context: Context,
+        private val previous: Thread.UncaughtExceptionHandler?
+    ) : Thread.UncaughtExceptionHandler {
+
+        override fun uncaughtException(thread: Thread, error: Throwable) {
+            // file first, screen second, hand back to the system last
+            runCatching { write("uncaught on ${thread.name}", error) }
+            runCatching { openScreen() }
+            if (previous != null && previous !== this) {
+                runCatching { previous.uncaughtException(thread, error) }
+            }
+        }
+
+        private fun openScreen() {
+            val intent = Intent(context, CrashActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+            context.startActivity(intent)
+        }
+    }
 }
