@@ -38,7 +38,6 @@
         <service
             android:name=".service.BypassAccessibilityService"
             android:exported="false"
-            android:label="@string/watcher_label"
             android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
             <intent-filter>
                 <action android:name="android.accessibilityservice.AccessibilityService" />

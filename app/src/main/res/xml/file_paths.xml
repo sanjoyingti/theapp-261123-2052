@@ -1,7 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <paths>
-    <files-path name="exports" path="exports/" />
-    <files-path name="projects" path="projects/" />
-    <files-path name="crashes" path="crashes/" />
-    <cache-path name="cache" path="." />
+    <files-path
+        name="arin_files"
+        path="." />
+    <cache-path
+        name="arin_cache"
+        path="." />
+    <external-files-path
+        name="arin_external"
+        path="." />
 </paths>

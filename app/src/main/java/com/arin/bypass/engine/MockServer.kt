@@ -2,80 +2,112 @@ package com.arin.bypass.engine
 
 import java.io.BufferedReader
 import java.io.InputStreamReader
+import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
-import kotlin.concurrent.thread
+import java.text.SimpleDateFormat
+import java.util.Collections
+import java.util.Date
+import java.util.Locale
 
 /**
- * Tiny loopback HTTP server for trying a patched app against hand written answers.
- * Start and stop are cheap and nothing is bound until the first start.
+ * Tiny loopback HTTP server used when a patched base URL points back at the phone.
+ * It answers every request with a small JSON body and keeps the last 200 requests so
+ * the log view can show what the clone actually asked for.
  */
-object MockServer {
+class MockServer {
 
-    const val PORT = 8099
+    private val lines: MutableList<String> = Collections.synchronizedList(ArrayList())
 
     @Volatile
-    private var server: ServerSocket? = null
+    private var socket: ServerSocket? = null
 
-    private val routes = LinkedHashMap<String, String>()
+    @Volatile
+    private var worker: Thread? = null
 
-    val running: Boolean get() = server?.isClosed == false
+    @Volatile
+    var running: Boolean = false
+        private set
 
-    fun baseUrl(): String = "http://127.0.0.1:$PORT"
+    @Volatile
+    var port: Int = 0
+        private set
 
-    fun routes(): List<Pair<String, String>> = synchronized(routes) { routes.toList() }
+    fun log(): List<String> = synchronized(lines) { lines.toList() }
 
-    fun put(path: String, body: String) {
-        synchronized(routes) { routes[normalise(path)] = body }
-    }
-
-    fun remove(path: String) {
-        synchronized(routes) { routes.remove(normalise(path)) }
-    }
-
-    fun start(): Result<Int> {
-        if (running) return Result.success(PORT)
-        return runCatching {
-            val socket = ServerSocket(PORT)
-            server = socket
-            val worker = thread(isDaemon = true, name = "bypass-mock-server") {
-                while (!socket.isClosed) {
-                    runCatching { socket.accept().use { answer(it) } }
-                }
-            }
-            worker.name
-            PORT
+    fun start(port: Int): Result<Unit> = runCatching {
+        if (running) {
+            add("Already listening on http://$HOST:$this.port")
+            return@runCatching
         }
+        val opened = ServerSocket(port, 32, InetAddress.getByName(HOST))
+        socket = opened
+        this.port = opened.localPort
+        running = true
+        add("Listening on http://$HOST:${opened.localPort}")
+        val thread = Thread { loop(opened) }
+        thread.isDaemon = true
+        thread.start()
+        worker = thread
     }
 
     fun stop() {
-        runCatching { server?.close() }
-        server = null
+        val opened = socket
+        running = false
+        socket = null
+        worker = null
+        runCatching { opened?.close() }
+        add("Stopped")
     }
 
-    private fun answer(client: Socket) {
-        val reader = BufferedReader(InputStreamReader(client.getInputStream()))
-        val requestLine = reader.readLine() ?: return
-        while (true) {
-            val line = reader.readLine() ?: break
-            if (line.isEmpty()) break
+    private fun loop(opened: ServerSocket) {
+        while (running) {
+            val client = runCatching { opened.accept() }.getOrNull() ?: break
+            runCatching { serve(client) }
+                .onFailure { add("Request failed: ${it.message ?: it::class.java.simpleName}") }
         }
-        val path = normalise(requestLine.split(" ").getOrElse(1) { "/" }.substringBefore('?'))
-        val body = synchronized(routes) { routes[path] }
-            ?: """{"bypass":true,"path":"$path"}"""
-        val payload = body.toByteArray(Charsets.UTF_8)
-        val header = buildString {
-            append("HTTP/1.1 200 OK\r\n")
-            append("Content-Type: application/json; charset=utf-8\r\n")
-            append("Content-Length: ").append(payload.size).append("\r\n")
-            append("Connection: close\r\n\r\n")
-        }
-        client.getOutputStream().apply {
-            write(header.toByteArray(Charsets.US_ASCII))
-            write(payload)
-            flush()
+        running = false
+    }
+
+    private fun serve(client: Socket) {
+        client.use { open ->
+            open.soTimeout = 5000
+            val reader = BufferedReader(InputStreamReader(open.getInputStream(), Charsets.UTF_8))
+            val requestLine = reader.readLine() ?: return
+            val path = requestLine.split(' ').getOrNull(1) ?: "/"
+            var guard = 0
+            while (guard < 100) {
+                val line = reader.readLine() ?: break
+                if (line.isEmpty()) break
+                guard++
+            }
+            add("${requestLine.substringBefore(' ')} $path")
+            val body = "{\"ok\":true,\"mock\":true,\"path\":\"${escape(path)}\"}"
+            val bytes = body.toByteArray(Charsets.UTF_8)
+            val head = buildString {
+                append("HTTP/1.1 200 OK\r\n")
+                append("Content-Type: application/json; charset=utf-8\r\n")
+                append("Content-Length: ").append(bytes.size).append("\r\n")
+                append("Connection: close\r\n\r\n")
+            }
+            val out = open.getOutputStream()
+            out.write(head.toByteArray(Charsets.UTF_8))
+            out.write(bytes)
+            out.flush()
         }
     }
 
-    private fun normalise(path: String): String = "/" + path.trim().trimStart('/')
+    private fun add(line: String) {
+        val stamp = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
+        synchronized(lines) {
+            lines.add("$stamp  $line")
+            while (lines.size > 200) lines.removeAt(0)
+        }
+    }
+
+    private fun escape(text: String): String = text.replace("\\", "\\\\").replace("\"", "\\\"")
+
+    private companion object {
+        const val HOST = "127.0.0.1"
+    }
 }

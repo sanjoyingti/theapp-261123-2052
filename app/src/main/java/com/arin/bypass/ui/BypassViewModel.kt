@@ -54,28 +54,35 @@ class BypassViewModel(private val container: AppContainer) : ViewModel() {
     private var loopJob: Job? = null
 
     init {
-        refresh()
         viewModelScope.launch {
-            runCatching { container.bypass.read().lastProject }
-                .getOrNull()
-                ?.let { id -> if (container.projects.load(id) != null) open(id) }
+            refresh()
+            val recent = withContext(Dispatchers.IO) {
+                runCatching { container.projects.list().firstOrNull() }.getOrNull()
+            }
+            if (recent != null && _state.value.open == null) open(recent.id)
         }
     }
 
     fun refresh() {
         viewModelScope.launch {
-            val projects = withContext(Dispatchers.IO) { container.projects.list() }
-            val settings = runCatching { container.settings.read() }.getOrDefault(Settings())
-            val session = runCatching { container.bypass.read() }.getOrNull()
-            val ready = withContext(Dispatchers.IO) { runCatching { container.toolchain.ready() }.getOrDefault(false) }
+            val projects = withContext(Dispatchers.IO) {
+                runCatching { container.projects.list() }.getOrDefault(emptyList())
+            }
+            val settings = withContext(Dispatchers.IO) {
+                runCatching { container.settings.read() }.getOrDefault(Settings())
+            }
+            val ready = withContext(Dispatchers.IO) {
+                runCatching { container.toolchain.ready() }.getOrDefault(false)
+            }
+            val watcher = runCatching { container.watcher.isEnabled(container.context) }.getOrDefault(false)
             _state.update {
                 it.copy(
                     loading = false,
                     projects = projects,
                     settings = settings,
                     toolsReady = ready,
-                    port = session?.mockPort ?: 8899,
-                    watcherOn = runCatching { container.watcher.isEnabled(container.context) }.getOrDefault(false)
+                    watcherOn = watcher,
+                    mockRunning = container.mock.running
                 )
             }
         }
@@ -88,7 +95,8 @@ class BypassViewModel(private val container: AppContainer) : ViewModel() {
     fun setPort(port: Int) {
         val safe = port.coerceIn(1024, 65535)
         _state.update { it.copy(port = safe) }
-        container.bypass.setPort(safe)
+        runCatching { container.bypass.setPort(safe) }
+            .onFailure { CrashLog.write("save port", it) }
     }
 
     // ---- projects ----
@@ -126,7 +134,8 @@ class BypassViewModel(private val container: AppContainer) : ViewModel() {
                 _state.update { it.copy(error = "That project could not be read.") }
                 return@launch
             }
-            container.bypass.setLastProject(id)
+            runCatching { container.bypass.setLastProject(id) }
+                .onFailure { CrashLog.write("save last project", it) }
             _state.update { it.copy(open = project, preview = "") }
         }
     }
@@ -379,7 +388,8 @@ class BypassViewModel(private val container: AppContainer) : ViewModel() {
     fun readProbe() {
         viewModelScope.launch {
             val text = withContext(Dispatchers.IO) { runCatching { container.probe.describe(container.context) }.getOrDefault("No reading.") }
-            _state.update { it.copy(probeText = text, watcherOn = runCatching { container.watcher.isEnabled(container.context) }.getOrDefault(false)) }
+            val on = runCatching { container.watcher.isEnabled(container.context) }.getOrDefault(false)
+            _state.update { it.copy(probeText = text, watcherOn = on) }
         }
     }
 
@@ -387,8 +397,9 @@ class BypassViewModel(private val container: AppContainer) : ViewModel() {
         viewModelScope.launch {
             val port = _state.value.port
             val result = withContext(Dispatchers.IO) { container.mock.start(port) }
-            result.onSuccess { _state.update { it.copy(mockRunning = true, notice = "The mock server is listening on 127.0.0.1:$port") } }
-                .onFailure { fail("mock", it) }
+            result.onSuccess {
+                _state.update { it.copy(mockRunning = true, notice = "The mock server is listening on 127.0.0.1:$port") }
+            }.onFailure { fail("mock", it) }
             readMockLog()
         }
     }

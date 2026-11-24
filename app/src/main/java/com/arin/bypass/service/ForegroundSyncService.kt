@@ -27,7 +27,7 @@ class ForegroundSyncService : Service() {
             val notification = NotificationCompat.Builder(this, CHANNEL)
                 .setSmallIcon(R.drawable.ic_launcher)
                 .setContentTitle(getString(R.string.app_name))
-                .setContentText(getString(R.string.notice_working))
+                .setContentText(TEXT_WORKING)
                 .setOngoing(true)
                 .setPriority(NotificationCompat.PRIORITY_LOW)
                 .build()
@@ -62,17 +62,15 @@ class ForegroundSyncService : Service() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val manager = getSystemService(NotificationManager::class.java) ?: return
         if (manager.getNotificationChannel(CHANNEL) != null) return
-        val channel = NotificationChannel(
-            CHANNEL,
-            getString(R.string.notice_channel),
-            NotificationManager.IMPORTANCE_LOW
-        )
+        val channel = NotificationChannel(CHANNEL, CHANNEL_NAME, NotificationManager.IMPORTANCE_LOW)
         channel.setShowBadge(false)
         manager.createNotificationChannel(channel)
     }
 
     companion object {
         private const val CHANNEL = "bypass_work"
+        private const val CHANNEL_NAME = "Bypass work"
+        private const val TEXT_WORKING = "Working on the project in the background"
         private const val ID = 4101
     }
 }
