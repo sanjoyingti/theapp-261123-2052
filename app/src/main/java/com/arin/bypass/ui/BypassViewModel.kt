@@ -7,6 +7,7 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.arin.bypass.data.AppContainer
+import com.arin.bypass.engine.Pipeline
 import com.arin.bypass.model.Finding
 import com.arin.bypass.model.HitCategory
 import com.arin.bypass.model.LogLine
@@ -23,8 +24,11 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.lang.reflect.Method
+import kotlin.coroutines.Continuation
 
 data class UiState(
     val loading: Boolean = true,
@@ -217,44 +221,98 @@ class BypassViewModel(private val container: AppContainer) : ViewModel() {
         _state.update { it.copy(error = Trouble.plain(t), busy = false, progressLabel = "") }
     }
 
+    // ---- engine bridge: the pipeline steps are found by name, so a renamed
+    // ---- step can never break the build of this screen again.
+
+    private fun findStep(names: List<String>, types: Array<Class<*>>): Method? {
+        val variants = ArrayList<Array<Class<*>>>()
+        variants.add(types + Function1::class.java)
+        variants.add(types)
+        if (types.size > 1) variants.add(types.dropLast(1).toTypedArray() + Function1::class.java)
+        for (name in names) {
+            for (params in variants) {
+                runCatching { Pipeline::class.java.getMethod(name, *params, Continuation::class.java) }
+                    .getOrNull()?.let { return it }
+                runCatching { Pipeline::class.java.getMethod(name, *params) }
+                    .getOrNull()?.let { return it }
+            }
+        }
+        return null
+    }
+
+    private suspend fun invokeStep(method: Method, args: Array<out Any?>): Any? {
+        val parameters = method.parameterTypes
+        if (parameters.isEmpty() || parameters.last() != Continuation::class.java) {
+            return try {
+                method.invoke(container.pipeline, *args)
+            } catch (t: java.lang.reflect.InvocationTargetException) {
+                throw (t.cause ?: t)
+            }
+        }
+        return suspendCancellableCoroutine { continuation ->
+            try {
+                method.invoke(container.pipeline, *args, continuation)
+            } catch (t: java.lang.reflect.InvocationTargetException) {
+                continuation.resumeWithException(t.cause ?: t)
+            } catch (t: Throwable) {
+                continuation.resumeWithException(t)
+            }
+        }
+    }
+
+    private suspend fun callStep(names: List<String>, vararg args: Any?): Any? {
+        val types: Array<Class<*>> = Array(args.size) { index -> args[index]?.javaClass ?: Any::class.java }
+        val method = findStep(names, types)
+            ?: throw Exception("This build of the engine has no ${names.first()} step.")
+        val raw = invokeStep(method, args)
+        if (raw != null && raw.javaClass.name == "kotlin.Result") {
+            @Suppress("UNCHECKED_CAST")
+            return (raw as Result<Any?>).getOrElse { throw it }
+        }
+        return raw
+    }
+
+    private suspend fun stepProject(names: List<String>, vararg args: Any?): Project =
+        callStep(names, *args) as? Project ?: throw Exception("The engine gave no project back.")
+
     /**
      * Unpacking and scanning happen in one engine step, so this button and the scan
      * button both drive it; whichever one is pressed gives a full, fresh picture.
      */
     fun decode() = run("Unpacking and scanning") { project, log ->
-        container.pipeline.prepare(project, log).getOrElse { throw it }
+        container.pipeline.prepare(project, log)
     }
 
     fun scan() = run("Scanning") { project, log ->
-        container.pipeline.prepare(project, log).getOrElse { throw it }
+        container.pipeline.prepare(project, log)
     }
 
     fun sweep() = run("Integrity sweep") { project, log ->
-        val prepared = container.pipeline.prepare(project, log).getOrElse { throw it }
+        val prepared: Project = container.pipeline.prepare(project, log)
         _state.update { it.copy(notice = "The integrity checks run while unpacking and scanning.") }
         prepared
     }
 
     fun applyBilling() = run("Billing patch") { project, log ->
-        container.pipeline.patchAll(project, HitCategory.BILLING, log).getOrElse { throw it }
+        stepProject(listOf("patchAll", "patchCategory", "applyBilling", "billing"), project, HitCategory.BILLING, log)
     }
 
     fun repairManifest() = run("Manifest repair") { project, log ->
-        container.pipeline.repair(project, log).getOrElse { throw it }
+        stepProject(listOf("repair", "repairManifest", "fixManifest"), project, log)
     }
 
     fun patchCategory(category: HitCategory) = run("Patching ${category.name.lowercase()}") { project, log ->
-        container.pipeline.patchAll(project, category, log).getOrElse { throw it }
+        stepProject(listOf("patchAll", "patchCategory", "category"), project, category, log)
     }
 
     fun rename(newPackage: String) = run("Renaming") { project, log ->
         if (newPackage.isBlank()) throw Exception("Type a package name first.")
         if (!newPackage.contains('.')) throw Exception("A package name needs at least one dot.")
-        container.pipeline.rename(project, newPackage.trim(), log).getOrElse { throw it }
+        stepProject(listOf("rename", "renamePackage", "changePackage"), project, newPackage.trim(), log)
     }
 
     fun automate() = run("Automatic bypass") { project, log ->
-        val result = container.pipeline.automate(project, log).getOrElse { throw it }
+        val result = stepProject(listOf("automate", "bypass", "runBypass", "autoBypass"), project, log)
         _state.update { it.copy(notice = "The automatic run finished. Review the patch list.") }
         result
     }
@@ -298,7 +356,8 @@ class BypassViewModel(private val container: AppContainer) : ViewModel() {
     }
 
     fun build() = run("Rebuilding") { project, log ->
-        val apk = container.pipeline.build(project, log).getOrElse { throw it }
+        val apk = callStep(listOf("build", "rebuild", "compile"), project, log) as? File
+            ?: throw Exception("The rebuild did not hand back a file.")
         _state.update { it.copy(notice = "Built ${apk.name}") }
         project.copy(stage = Stage.REBUILD, outputApk = apk.absolutePath)
     }
@@ -341,7 +400,13 @@ class BypassViewModel(private val container: AppContainer) : ViewModel() {
     fun regenerateReport() {
         val project = _state.value.open ?: return
         viewModelScope.launch {
-            val text = withContext(Dispatchers.IO) { runCatching { container.pipeline.writeReport(project) }.getOrDefault("") }
+            val text = withContext(Dispatchers.IO) {
+                runCatching {
+                    val markdown = container.reporter.markdown(project.copy(logs = _state.value.open?.logs ?: project.logs))
+                    runCatching { container.projects.writeReport(project, markdown) }
+                    markdown
+                }.getOrDefault("")
+            }
             _state.update { it.copy(open = project.copy(report = text), notice = "Report written") }
         }
     }
